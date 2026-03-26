@@ -1,4 +1,22 @@
-"""Semi-supervised SFT script built on top of the stock qwen3_asr_sft.py."""
+"""Semi-supervised SFT script built on top of the stock ``qwen3_asr_sft.py``.
+
+The original repository already provides supervised fine-tuning against
+``audio -> transcript`` JSONL pairs. This extension adds one practical feature:
+mixing high-quality supervised labels with lower-confidence pseudo labels in the
+same training run.
+
+The key idea is intentionally simple:
+
+1. Both supervised and pseudo-labeled samples are converted into the same input
+   format.
+2. The collator still builds one multimodal prompt and one decoder target per
+   example.
+3. Instead of averaging all sample losses equally, the trainer applies a
+   per-sample weight so pseudo labels influence the model more gently.
+
+This keeps the training recipe close to the stock script while making it useful
+for dialect adaptation scenarios where unlabeled audio is abundant.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +36,7 @@ if REPO_ROOT not in sys.path:
 
 
 def build_prefix_messages(prompt: str, audio_array):
+    """Build the minimal chat-template structure expected by the processor."""
     return [
         {"role": "system", "content": prompt or ""},
         {"role": "user", "content": [{"type": "audio", "audio": audio_array}]},
@@ -25,6 +44,7 @@ def build_prefix_messages(prompt: str, audio_array):
 
 
 def load_audio(path: str, sr: int = 16000):
+    """Load one waveform as mono audio at the requested sample rate."""
     import librosa
 
     wav, _ = librosa.load(path, sr=sr, mono=True)
@@ -32,7 +52,12 @@ def load_audio(path: str, sr: int = 16000):
 
 
 def make_preprocess_fn_prefix_only(processor):
-    """Materialize prefix text and preserve per-sample loss weights."""
+    """Materialize prefix text and preserve per-sample loss weights.
+
+    This mirrors the stock SFT recipe: prompt text is rendered once during
+    dataset preprocessing, while the expensive audio loading stays inside the
+    collator at batch time.
+    """
 
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
         prompt = ex.get("prompt", "")
@@ -60,6 +85,13 @@ class DataCollatorForQwen3ASRSemiSup:
     sampling_rate: int = 16000
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Build a multimodal batch and attach per-sample weights.
+
+        Training principle:
+            Like the stock script, this collator masks prompt-prefix tokens with
+            ``-100`` so only the decoder-side transcription suffix contributes to
+            the language-model loss.
+        """
         audio_paths = [f["audio"] for f in features]
         prefix_texts = [f["prefix_text"] for f in features]
         targets = [f["target"] for f in features]
@@ -102,6 +134,12 @@ class DataCollatorForQwen3ASRSemiSup:
 
 
 def build_trainer_class():
+    """Create a Trainer subclass that supports sample-weighted LM loss.
+
+    Defining the class inside a function avoids importing ``transformers.Trainer``
+    at module import time, which keeps ``--help`` lightweight in partially
+    provisioned environments.
+    """
     from transformers import Trainer
 
     class WeightedCastFloatInputsTrainer(Trainer):
@@ -117,6 +155,12 @@ def build_trainer_class():
             return inputs
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            """Compute weighted autoregressive cross-entropy.
+
+            The stock model already exposes a scalar ``loss``. We re-compute the
+            token loss here only when sample weights are present so we can scale
+            each sample before reducing across the batch.
+            """
             loss_weight = inputs.pop("loss_weight", None)
             labels = inputs.get("labels")
             outputs = model(**inputs)
@@ -148,6 +192,7 @@ def build_trainer_class():
 
 
 def parse_args():
+    """Define CLI arguments for mixed supervised/pseudo fine-tuning."""
     p = argparse.ArgumentParser("Qwen3-ASR Semi-Supervised Finetuning")
 
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
@@ -184,6 +229,7 @@ def parse_args():
 
 
 def load_json_dataset(path: str):
+    """Load one JSON/JSONL dataset split with the Hugging Face datasets library."""
     from datasets import load_dataset
 
     ds = load_dataset("json", data_files={"train": path})
@@ -191,12 +237,14 @@ def load_json_dataset(path: str):
 
 
 def maybe_trim_dataset(ds, max_samples: int, seed: int):
+    """Optionally downsample a dataset for ablations or smoke tests."""
     if max_samples <= 0 or len(ds) <= max_samples:
         return ds
     return ds.shuffle(seed=seed).select(range(max_samples))
 
 
 def attach_metadata(ds, default_weight: float, source: str):
+    """Attach normalized metadata columns expected by the mixed-training pipeline."""
     def _map(ex):
         out = dict(ex)
         out["loss_weight"] = float(ex.get("loss_weight", default_weight))
@@ -208,6 +256,12 @@ def attach_metadata(ds, default_weight: float, source: str):
 
 
 def build_train_dataset(args, processor):
+    """Load, tag, concatenate and preprocess train datasets.
+
+    Qwen3-ASR itself does not care whether a row came from human annotation or
+    pseudo labeling. That distinction only matters for weighting and experiment
+    analysis, so we encode it as metadata instead of branching the model code.
+    """
     from datasets import concatenate_datasets
 
     supervised_path = args.supervised_train_file or args.train_file
@@ -241,6 +295,7 @@ def build_train_dataset(args, processor):
 
 
 def build_eval_dataset(args, processor):
+    """Build the optional evaluation split using the same preprocessing recipe."""
     if not args.eval_file:
         return None
     from datasets import load_dataset
@@ -257,6 +312,7 @@ def build_eval_dataset(args, processor):
 
 
 def main():
+    """Run semi-supervised fine-tuning with a stock Qwen3-ASR checkpoint."""
     args = parse_args()
     from qwen3_asr_sft import (
         MakeEveryCheckpointInferableCallback,
@@ -279,6 +335,9 @@ def main():
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
+    # All dataset mixing happens outside the model. By the time batches reach
+    # the network, both supervised and pseudo-labeled examples share the same
+    # tensor contract.
     train_dataset = build_train_dataset(args, processor)
     eval_dataset = build_eval_dataset(args, processor)
     collator = DataCollatorForQwen3ASRSemiSup(processor=processor, sampling_rate=args.sr)

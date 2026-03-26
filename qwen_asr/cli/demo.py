@@ -13,8 +13,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-A gradio demo for Qwen3 ASR models.
+"""Gradio demo for Qwen3-ASR.
+
+This file is primarily an integration layer rather than a modeling component.
+It demonstrates how the high-level ``Qwen3ASRModel`` wrapper can be embedded in
+an interactive application while keeping three concerns separate:
+
+1. Browser/UI compatibility:
+   Gradio may hand back audio in different tuple/dict shapes depending on the
+   version and frontend runtime.
+2. Runtime configuration:
+   Users may want either the Transformers backend or the vLLM backend with
+   backend-specific kwargs.
+3. Output visualization:
+   Qwen3-ASR can optionally return timestamp-aligned text segments, which the
+   demo turns into inline HTML audio previews.
+
+The code is therefore a good example of how to build a thin application shell
+around the repository's public inference APIs without touching model internals.
 """
 
 import argparse
@@ -284,7 +300,10 @@ def _coerce_special_types(d: Dict[str, Any]) -> Dict[str, Any]:
 def _make_timestamp_html(audio_upload: Any, timestamps: Any) -> str:
     """
     Build HTML with per-token audio slices, using base64 data URLs.
-    Expect timestamps as list[dict] with keys: text, start_time, end_time (ms).
+
+    The forced aligner returns logical text spans with start/end times. The demo
+    translates those spans back into browser-playable micro audio clips so users
+    can inspect alignment quality visually and acoustically.
     """
     at = _audio_to_tuple(audio_upload)
     if at is None:
@@ -528,6 +547,8 @@ def main(argv=None) -> int:
         aligner_kwargs = _merge_dicts(_default_aligner_kwargs(), user_aligner_kwargs)
         forced_aligner_kwargs = _coerce_special_types(aligner_kwargs)
 
+    # The demo keeps backend selection at the boundary. Once the wrapper is
+    # created, the UI below can remain backend-agnostic.
     if backend == "transformers":
         asr = Qwen3ASRModel.from_pretrained(
             asr_ckpt,
@@ -556,6 +577,9 @@ def main(argv=None) -> int:
     if args.ssl_keyfile is not None:
         launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
 
+    # Gradio's queue provides simple request backpressure and concurrency control
+    # so a single demo process does not over-commit GPU memory immediately under
+    # multiple browser requests.
     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
     return 0
 

@@ -13,11 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Thin wrapper around ``vllm serve`` for Qwen3-ASR.
+"""Thin wrapper around ``vllm serve`` for Qwen3-ASR.
 
-The only reason this file exists is to register the custom Qwen3-ASR model and
-processor classes before handing control to vLLM's standard CLI.
+Qwen3-ASR is not one of vLLM's built-in model families, so a plain ``vllm
+serve`` command would not know how to instantiate the custom multimodal model
+class and processor. This file solves exactly that bootstrapping problem:
+
+1. Register the Hugging Face config/model/processor classes.
+2. Register the custom vLLM model implementation.
+3. Delegate argument parsing and serving behavior back to upstream vLLM.
+
+The result is operationally simple for users while keeping all Qwen3-ASR-
+specific knowledge localized in one small entrypoint.
 """
 
 import sys

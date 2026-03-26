@@ -1,4 +1,17 @@
-"""Prepare Qwen3-ASR fine-tuning manifests from labeled csv/tsv/json/jsonl files."""
+"""Prepare Qwen3-ASR fine-tuning manifests from labeled corpora.
+
+This script sits between raw human annotation exports and the repository's
+training script. In practice it solves three recurring problems:
+
+1. Annotation tools often export CSV/TSV, while training prefers JSONL.
+2. Audio paths in datasets are frequently relative and need to be resolved
+   reproducibly.
+3. Human transcripts are plain text, but Qwen3-ASR SFT expects targets to use
+   the decoder-side protocol ``language X<asr_text>...``.
+
+The output JSONL is intentionally minimal so it can be consumed directly by
+``finetuning/qwen3_asr_sft.py`` or the semi-supervised extension script.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +30,7 @@ from asr_data_utils import (
 
 
 def parse_args():
+    """Define the CLI contract for labeled-data normalization."""
     p = argparse.ArgumentParser("Prepare JSONL for Qwen3-ASR fine-tuning")
     p.add_argument("--input_manifest", required=True, help="csv/tsv/json/jsonl with at least audio and text columns")
     p.add_argument("--input_format", default="auto", choices=["auto", "csv", "tsv", "json", "jsonl"])
@@ -36,6 +50,12 @@ def parse_args():
 
 
 def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
+    """Normalize one manifest row into the training JSONL schema.
+
+    The function is intentionally strict about required columns. Failing early
+    here is better than discovering malformed training data deep inside a GPU
+    training run.
+    """
     if args.audio_key not in row:
         raise KeyError(f"Missing audio column: {args.audio_key}")
     if args.text_key not in row:
@@ -62,6 +82,7 @@ def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
 
 
 def main():
+    """Run end-to-end manifest loading, normalization, splitting and writing."""
     args = parse_args()
     rows = read_manifest_rows(args.input_manifest, fmt=args.input_format)
     normalized: List[Dict[str, object]] = []

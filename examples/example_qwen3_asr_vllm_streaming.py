@@ -13,12 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Examples for Qwen3ASRModel Streaming Inference (vLLM backend).
+"""Examples for Qwen3ASRModel streaming inference (vLLM backend).
 
-Note:
-  Requires vLLM extra:
-    pip install qwen-asr[vllm]
+This example is intentionally procedural and print-heavy. The goal is not to be
+an elegant application, but to make the streaming API mechanics visible:
+
+1. Load one utterance.
+2. Resample it to the 16 kHz domain expected by the released checkpoint.
+3. Feed the waveform into ``streaming_transcribe`` in progressively smaller
+   chunks.
+4. Observe how partial hypotheses evolve before the final flush.
 """
 
 import io
@@ -50,7 +54,12 @@ def _read_wav_from_bytes(audio_bytes: bytes) -> Tuple[np.ndarray, int]:
 
 
 def _resample_to_16k(wav: np.ndarray, sr: int) -> np.ndarray:
-    """Simple resample to 16k if needed (uses linear interpolation; good enough for a test)."""
+    """Simple resample to 16 kHz if needed.
+
+    This example intentionally avoids bringing in an additional DSP dependency
+    just for a demo script. Linear interpolation is not ideal for production
+    audio preprocessing, but it is sufficient to illustrate the streaming API.
+    """
     if sr == 16000:
         return wav.astype(np.float32, copy=False)
     wav = wav.astype(np.float32, copy=False)
@@ -95,11 +104,12 @@ def run_streaming_case(asr: Qwen3ASRModel, wav16k: np.ndarray, step_ms: int) -> 
 
 def main() -> None:
     """Load the vLLM backend once and compare several chunk cadences."""
-    # Streaming is vLLM-only and no forced aligner supported.
+    # Streaming is exposed only by the vLLM backend in this repository, and
+    # timestamp recovery is not part of the streaming path.
     asr = Qwen3ASRModel.LLM(
         model=ASR_MODEL_PATH,
         gpu_memory_utilization=0.8,
-        max_new_tokens=32, # set a small value for streaming
+        max_new_tokens=32,  # Small decoding horizon keeps partial outputs snappy.
     )
 
     audio_bytes = _download_audio_bytes(URL_EN)

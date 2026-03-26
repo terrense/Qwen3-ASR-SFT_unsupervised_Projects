@@ -1,4 +1,18 @@
-"""Generate pseudo labels for Qwen3-ASR semi-supervised training."""
+"""Generate pseudo labels for Qwen3-ASR semi-supervised training.
+
+Conceptually this script turns unlabeled speech into weakly supervised training
+data:
+
+1. Gather audio either from a manifest or directly from a directory.
+2. Run the released Qwen3-ASR checkpoint as a teacher model.
+3. Store the decoded text back into the same JSONL schema used by supervised
+   SFT, with an extra ``loss_weight`` that later training can down-weight.
+
+This is not "true" self-supervised learning in the HuBERT/wav2vec sense. It is
+teacher-generated pseudo labeling, which is often the most practical way to
+exploit large untranscribed dialect corpora in an instruction-decoder ASR setup
+like Qwen3-ASR.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +24,9 @@ from typing import Dict, List
 
 import torch
 
+# Adding the repository root to ``sys.path`` lets the script run directly from a
+# source checkout without requiring the package to be installed into the active
+# environment first.
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
@@ -24,7 +41,10 @@ from asr_data_utils import (
     resolve_audio_path,
     write_jsonl,
 )
+
+
 def parse_args():
+    """Define CLI options for pseudo-label generation."""
     p = argparse.ArgumentParser("Generate pseudo labels for Qwen3-ASR")
     p.add_argument("--model_path", required=True)
     p.add_argument("--output_file", required=True)
@@ -48,12 +68,14 @@ def parse_args():
 
 
 def choose_dtype():
+    """Pick a reasonable inference dtype from the available CUDA capability."""
     if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
         return torch.bfloat16
     return torch.float16
 
 
 def build_input_rows(args) -> List[Dict[str, object]]:
+    """Collect audio inputs from either a manifest or a directory tree."""
     if bool(args.input_manifest) == bool(args.audio_dir):
         raise ValueError("Set exactly one of --input_manifest or --audio_dir")
 
@@ -84,6 +106,12 @@ def build_input_rows(args) -> List[Dict[str, object]]:
 
 
 def load_model(args):
+    """Load the teacher ASR model using either the Transformers or vLLM backend.
+
+    Python note:
+        The import is intentionally local so ``--help`` can work even in
+        environments where model dependencies are not fully installed yet.
+    """
     from qwen_asr import Qwen3ASRModel
 
     backend_kwargs = json.loads(args.backend_kwargs_json)
@@ -98,6 +126,7 @@ def load_model(args):
 
 
 def choose_target_language(args, detected_language: str) -> str:
+    """Choose which language prefix should be written into the training target."""
     mode = str(args.train_language).strip()
     if not mode:
         return "None"
@@ -107,6 +136,12 @@ def choose_target_language(args, detected_language: str) -> str:
 
 
 def main():
+    """Run pseudo-label generation and persist the result as JSONL.
+
+    The output schema intentionally mirrors supervised training rows so later
+    mixed training can be implemented by simple dataset concatenation instead of
+    format-specific branches.
+    """
     args = parse_args()
     rows = build_input_rows(args)
     asr = load_model(args)
@@ -114,6 +149,8 @@ def main():
     outputs: List[Dict[str, object]] = []
 
     for batch in batched(rows, args.batch_size):
+        # Batched transcription keeps GPU utilization reasonable while still
+        # preserving the simple list-of-records data model at the script level.
         audios = [item["audio"] for item in batch]
         prompts = [item["prompt"] for item in batch]
         results = asr.transcribe(audio=audios, context=prompts, language=decode_language)

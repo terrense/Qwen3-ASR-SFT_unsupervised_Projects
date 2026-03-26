@@ -13,16 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Minimal web demo for Qwen3ASRModel Streaming Inference (vLLM backend).
+"""Minimal web demo for Qwen3-ASR streaming inference (vLLM backend).
 
-Install:
-  pip install qwen-asr[vllm]
+Architecturally this file shows how the repository's streaming API maps onto a
+very small web service:
 
-Run:
-  python streaming/demo_qwen3_asr_vllm_streaming.py
-Open:
-  http://127.0.0.1:7860
+1. ``/api/start`` creates one decoder state object per browser session.
+2. ``/api/chunk`` feeds float32 PCM frames incrementally into that state.
+3. ``/api/finish`` flushes any buffered tail audio and returns the final text.
+
+The implementation uses Flask and an in-memory session table on purpose. It is
+not a production deployment template; it is a compact reference for how the
+streaming state machine exposed by ``Qwen3ASRModel`` can be driven over HTTP.
 """
 import argparse
 import time
@@ -46,6 +48,8 @@ class Session:
 
 app = Flask(__name__)
 
+# These globals are initialized in ``main()`` exactly once, then read by the
+# request handlers. This is acceptable for a single-process demo server.
 global asr
 global UNFIXED_CHUNK_NUM
 global UNFIXED_TOKEN_NUM
@@ -450,6 +454,8 @@ def api_chunk():
     if len(raw) % 4 != 0:
         return jsonify({"error": "float32 bytes length not multiple of 4"}), 400
 
+    # The browser client sends raw float32 PCM rather than WAV containers. That
+    # keeps the transport small and avoids re-parsing headers on every chunk.
     wav = np.frombuffer(raw, dtype=np.float32).reshape(-1)
 
     asr.streaming_transcribe(wav, s.state)

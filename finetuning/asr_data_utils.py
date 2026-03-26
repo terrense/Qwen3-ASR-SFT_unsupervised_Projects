@@ -1,4 +1,20 @@
-"""Utility helpers for ASR manifest preparation and pseudo-label pipelines."""
+"""Utility helpers for ASR manifest preparation and pseudo-label pipelines.
+
+This file is intentionally lightweight and dependency-thin. The role of these
+helpers is not to perform ASR itself, but to normalize the "messy outer world"
+around training:
+
+1. Manifest files may arrive as CSV/TSV/JSON/JSONL with slightly different
+   field conventions.
+2. Audio paths may be absolute, relative to the manifest, or relative to a
+   separately mounted corpus root.
+3. Text may be raw transcript text, while Qwen3-ASR training expects the
+   protocol-like target format ``language X<asr_text>...``.
+
+From a Python design perspective, keeping these helpers pure and mostly
+stateless makes them reusable from multiple scripts without dragging model
+dependencies into simple data-preparation workflows.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +38,13 @@ AUDIO_EXTENSIONS = {
 
 
 def infer_manifest_format(path: str) -> str:
+    """Infer the manifest parser from the filename extension.
+
+    Python note:
+        Returning a small canonical string here lets the rest of the module
+        dispatch with explicit ``if`` branches instead of relying on dynamic
+        file sniffing, which keeps behavior predictable.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".jsonl":
         return "jsonl"
@@ -35,7 +58,11 @@ def infer_manifest_format(path: str) -> str:
 
 
 def read_manifest_rows(path: str, fmt: str = "auto") -> List[Dict[str, object]]:
-    """Read rows from csv/tsv/json/jsonl manifest files."""
+    """Read rows from CSV/TSV/JSON/JSONL manifest files.
+
+    The returned value is always ``List[Dict[str, object]]`` so downstream
+    training scripts can treat all manifest sources uniformly.
+    """
     fmt = infer_manifest_format(path) if fmt == "auto" else fmt.lower()
     if fmt == "jsonl":
         rows: List[Dict[str, object]] = []
@@ -74,7 +101,19 @@ def resolve_audio_path(
     manifest_path: Optional[str] = None,
     audio_root: str = "",
 ) -> str:
-    """Resolve relative audio paths against either audio_root or manifest dir."""
+    """Resolve relative audio paths against either ``audio_root`` or manifest dir.
+
+    Search order is deliberate:
+
+    1. If the path is already absolute, keep it.
+    2. Try ``audio_root`` first when the caller provides an explicit corpus root.
+    3. Fall back to the manifest directory, which is common for self-contained
+       datasets.
+    4. Finally interpret the value relative to the current working directory.
+
+    Returning the first existing path keeps the caller logic simple while still
+    supporting several dataset layouts.
+    """
     audio_path = str(audio_path).strip()
     if not audio_path:
         raise ValueError("audio path is empty")
@@ -98,6 +137,13 @@ def resolve_audio_path(
 
 
 def ensure_prompt(prompt: object, default_prompt: str = "") -> str:
+    """Convert optional prompt-like values into a clean string.
+
+    Python note:
+        ``object`` is accepted instead of ``Optional[str]`` because values may
+        come from CSV readers or JSON parsing with inconsistent types. The
+        helper centralizes the normalization policy in one place.
+    """
     if prompt is None:
         return default_prompt
     text = str(prompt).strip()
@@ -105,11 +151,18 @@ def ensure_prompt(prompt: object, default_prompt: str = "") -> str:
 
 
 def has_asr_prefix(text: str) -> bool:
+    """Check whether a transcript already uses the Qwen3-ASR target protocol."""
     return "<asr_text>" in text
 
 
 def format_asr_target(text: str, language: str = "Chinese") -> str:
-    """Add the repo's expected language prefix when missing."""
+    """Add the repo's expected language prefix when missing.
+
+    Qwen3-ASR does not train against plain transcript text in this repo's SFT
+    scripts. Instead, the target is a lightweight textual protocol such as
+    ``language Chinese<asr_text>你好``. That format allows the same decoder to
+    emit both language metadata and transcription content.
+    """
     text = str(text).strip()
     if not text:
         raise ValueError("transcript text is empty")
@@ -121,6 +174,7 @@ def format_asr_target(text: str, language: str = "Chinese") -> str:
 
 
 def write_jsonl(path: str, rows: Iterable[Dict[str, object]]) -> int:
+    """Write an iterable of dictionaries to UTF-8 JSONL and return row count."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     count = 0
     with open(path, "w", encoding="utf-8") as f:
@@ -131,6 +185,7 @@ def write_jsonl(path: str, rows: Iterable[Dict[str, object]]) -> int:
 
 
 def maybe_limit_rows(rows: Sequence[Dict[str, object]], max_rows: int) -> List[Dict[str, object]]:
+    """Optionally truncate rows for debugging or quick smoke tests."""
     if max_rows <= 0:
         return list(rows)
     return list(rows[: max_rows])
@@ -143,6 +198,12 @@ def split_rows(
     seed: int,
     shuffle: bool,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Split rows into train/eval partitions with optional deterministic shuffle.
+
+    The implementation intentionally guarantees at least one train example when
+    the input has more than one row. That protects quick experiments from
+    accidentally producing an empty training set with a high ``eval_ratio``.
+    """
     rows = list(rows)
     if shuffle:
         rng = random.Random(seed)
@@ -164,6 +225,11 @@ def split_rows(
 
 
 def collect_audio_files(audio_dir: str, recursive: bool = True) -> List[str]:
+    """Collect audio files from a directory in stable sorted order.
+
+    Stable ordering matters for pseudo-label generation because it makes runs
+    easier to reproduce and compare.
+    """
     if not os.path.isdir(audio_dir):
         raise ValueError(f"audio directory does not exist: {audio_dir}")
 
@@ -184,6 +250,13 @@ def collect_audio_files(audio_dir: str, recursive: bool = True) -> List[str]:
 
 
 def batched(items: Sequence[object], batch_size: int) -> Iterator[Sequence[object]]:
+    """Yield fixed-size slices from a sequence.
+
+    Python note:
+        This helper returns views via slicing rather than building a generator
+        over iterators because the scripts using it already materialize lists and
+        benefit from straightforward indexing semantics.
+    """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     for start in range(0, len(items), batch_size):
