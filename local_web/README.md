@@ -4,8 +4,30 @@ This folder is a minimal Windows-friendly setup for testing Qwen3-ASR locally:
 
 1. Build the Docker image from the repository Dockerfile.
 2. Start a local Qwen3-ASR server in Docker.
-3. Start a tiny static web server for `index.html`.
-4. Open the page in a browser and upload audio.
+3. Open a browser UI and test file upload or streaming.
+
+## Recommended: one container, multiple capabilities
+
+If you want to avoid loading the model multiple times, use the unified gateway.
+It serves one page and multiple API routes from one model process:
+
+- `/api/info`: capability discovery
+- `/api/transcribe`: one-shot file transcription
+- `/api/stream/*`: live streaming transcription
+
+Start it with:
+
+```powershell
+.\local_web\start_qwen3_asr_gateway.ps1
+```
+
+Open:
+
+```text
+http://localhost:8003
+```
+
+This is now the preferred setup if you care about GPU memory.
 
 ### 1) Build the image
 
@@ -54,8 +76,9 @@ http://localhost:8081
 
 ### 4) Start the built-in streaming web demo
 
-For live partial transcription, use the custom launcher that lowers vLLM memory
-pressure on smaller GPUs:
+For live partial transcription, use the custom subtitle-oriented launcher that
+lowers vLLM memory pressure on smaller GPUs and keeps committed subtitle history
+visible while only refreshing the unstable tail:
 
 ```powershell
 .\local_web\start_qwen3_asr_streaming.ps1
@@ -64,7 +87,7 @@ pressure on smaller GPUs:
 Open:
 
 ```text
-http://localhost:8002
+http://localhost:8003
 ```
 
 If your GPU still struggles, try:
@@ -78,3 +101,5 @@ If your GPU still struggles, try:
 - The page sends local audio as a base64 data URL to the OpenAI-style `chat/completions` endpoint.
 - If Docker image build fails while pulling base layers, rerun the build script once. Layer pull failures are often transient.
 - If the browser reports a network error, verify the container is actually serving on `localhost:8000`.
+- Qwen3-ASR streaming revises the trailing hypothesis on each chunk. The new `8003` page shows this as `committed history + live tail` instead of replacing the whole subtitle block.
+- The unified gateway is the better long-term shape: one container, one model instance, many HTTP routes.

@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qwen3-ASR Unified Gateway</title>
+  <style>
+    :root {
+      --bg: #f6f4ee;
+      --panel: rgba(255, 255, 255, 0.9);
+      --text: #1e2430;
+      --muted: #5f6775;
+      --line: #d8d2c6;
+      --accent: #146c63;
+      --accent-2: #ef7d57;
+      --ok: #1f8a56;
+      --err: #b53b35;
+      --shadow: 0 18px 45px rgba(24, 28, 36, 0.08);
+      --stable-bg: #fffefb;
+      --live-bg: #edf4ff;
+      --live-text: #1d4ed8;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(20, 108, 99, 0.15), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(239, 125, 87, 0.16), transparent 30%),
+        linear-gradient(180deg, #faf8f2 0%, var(--bg) 100%);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    .page {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+
+    .hero {
+      margin-bottom: 22px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(20, 108, 99, 0.12);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 12px 0 10px;
+      font-size: clamp(30px, 4vw, 46px);
+      line-height: 1.05;
+    }
+
+    .sub {
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.75;
+    }
+
+    .info-grid,
+    .main-grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .info-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-bottom: 18px;
+    }
+
+    .main-grid {
+      grid-template-columns: 420px minmax(0, 1fr);
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(216, 210, 198, 0.9);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      padding: 20px;
+    }
+
+    .card h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    input[type="text"],
+    input[type="file"],
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font: inherit;
+      color: var(--text);
+      background: #fffdfa;
+    }
+
+    textarea {
+      min-height: 84px;
+      resize: vertical;
+      line-height: 1.6;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.08s ease, opacity 0.2s ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+    .primary {
+      background: linear-gradient(135deg, var(--accent), #0f8d7e);
+      color: white;
+    }
+
+    .ghost {
+      background: rgba(239, 125, 87, 0.12);
+      color: #9b4b32;
+    }
+
+    .danger {
+      background: rgba(181, 59, 53, 0.12);
+      color: #962c28;
+    }
+
+    .status {
+      min-height: 22px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+
+    .result-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .result-block {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fffefb;
+      padding: 16px;
+    }
+
+    .result-block h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .subtitle-wrap {
+      display: grid;
+      gap: 12px;
+    }
+
+    .subtitle-box {
+      min-height: 130px;
+    }
+
+    .subtitle-content {
+      min-height: 96px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.8;
+      border-radius: 14px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 260px;
+    }
+
+    #committedText {
+      background: var(--stable-bg);
+      border: 1px solid var(--line);
+      font-size: 17px;
+    }
+
+    #liveText {
+      background: var(--live-bg);
+      border: 1px dashed rgba(29, 78, 216, 0.35);
+      color: var(--live-text);
+      font-weight: 600;
+      font-size: 17px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: rgba(20, 108, 99, 0.1);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      margin-right: 8px;
+      margin-bottom: 8px;
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .hint {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 960px) {
+      .info-grid,
+      .main-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="eyebrow">Unified Gateway</span>
+      <h1>Qwen3-ASR 单容器多能力入口</h1>
+      <div class="sub">
+        这一页不再依赖“一个端口一个能力”的拆分方式。普通文件转录、实时流式转录和能力发现接口都挂在同一个服务下面，
+        只加载一份模型实例，前端通过统一协议路径访问不同能力。
+      </div>
+    </section>
+
+    <section class="info-grid">
+      <div class="card">
+        <h2>Service</h2>
+        <div id="infoPills"></div>
+      </div>
+      <div class="card">
+        <h2>Routes</h2>
+        <pre id="routesJson"></pre>
+      </div>
+      <div class="card">
+        <h2>Info JSON</h2>
+        <pre id="infoJson"></pre>
+      </div>
+    </section>
+
+    <section class="main-grid">
+      <div class="card">
+        <h2>文件转录</h2>
+        <div class="field">
+          <label for="fileInput">音频文件</label>
+          <input id="fileInput" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg" />
+        </div>
+        <div class="field">
+          <label for="languageInput">强制语言，可留空</label>
+          <input id="languageInput" type="text" placeholder="例如 Chinese / English" />
+        </div>
+        <div class="field">
+          <label for="contextInput">上下文提示，可留空</label>
+          <textarea id="contextInput" placeholder="例如：武汉地名、人名、专业词汇"></textarea>
+        </div>
+        <div class="actions">
+          <button id="transcribeBtn" class="primary">开始转录</button>
+          <button id="clearTranscribeBtn" class="ghost" type="button">清空结果</button>
+        </div>
+        <div id="transcribeStatus" class="status"></div>
+
+        <div class="hint">
+          调用接口：<code>/api/transcribe</code><br />
+          请求方式：JSON，字段包含 <code>audio_data_url</code>、<code>context</code>、<code>language</code>。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>文件转录结果</h2>
+        <div class="result-grid">
+          <div class="result-block">
+            <h3>Language</h3>
+            <pre id="offlineLanguage"></pre>
+          </div>
+          <div class="result-block">
+            <h3>Text</h3>
+            <pre id="offlineText"></pre>
+          </div>
+          <div class="result-block">
+            <h3>Response JSON</h3>
+            <pre id="offlineJson"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="main-grid" style="margin-top:18px;">
+      <div class="card">
+        <h2>实时流式转录</h2>
+        <div class="field">
+          <label for="streamLanguageInput">强制语言，可留空</label>
+          <input id="streamLanguageInput" type="text" placeholder="例如 Chinese / English" />
+        </div>
+        <div class="field">
+          <label for="streamContextInput">上下文提示，可留空</label>
+          <textarea id="streamContextInput" placeholder="例如：当前会议主题、专有名词"></textarea>
+        </div>
+        <div class="actions">
+          <button id="startStreamBtn" class="primary">开始麦克风</button>
+          <button id="stopStreamBtn" class="danger" disabled>停止</button>
+          <button id="clearStreamBtn" class="ghost" type="button">清空字幕</button>
+        </div>
+        <div id="streamStatus" class="status"></div>
+
+        <div class="hint">
+          调用接口：<code>/api/stream/start</code>、<code>/api/stream/chunk</code>、<code>/api/stream/finish</code><br />
+          上方历史字幕保持不删，下方蓝色尾巴仍可能被模型修订。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>流式字幕</h2>
+        <div class="result-grid">
+          <div class="result-block">
+            <h3>Language</h3>
+            <pre id="streamLanguage"></pre>
+          </div>
+          <div class="subtitle-wrap">
+            <div class="result-block subtitle-box">
+              <h3>Committed History</h3>
+              <div id="committedText" class="subtitle-content"></div>
+            </div>
+            <div class="result-block subtitle-box">
+              <h3>Live Tail</h3>
+              <div id="liveText" class="subtitle-content"></div>
+            </div>
+          </div>
+          <div class="result-block">
+            <h3>Streaming JSON</h3>
+            <pre id="streamJson"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const infoPillsEl = document.getElementById("infoPills");
+    const routesJsonEl = document.getElementById("routesJson");
+    const infoJsonEl = document.getElementById("infoJson");
+
+    const fileInputEl = document.getElementById("fileInput");
+    const languageInputEl = document.getElementById("languageInput");
+    const contextInputEl = document.getElementById("contextInput");
+    const transcribeBtnEl = document.getElementById("transcribeBtn");
+    const clearTranscribeBtnEl = document.getElementById("clearTranscribeBtn");
+    const transcribeStatusEl = document.getElementById("transcribeStatus");
+    const offlineLanguageEl = document.getElementById("offlineLanguage");
+    const offlineTextEl = document.getElementById("offlineText");
+    const offlineJsonEl = document.getElementById("offlineJson");
+
+    const streamLanguageInputEl = document.getElementById("streamLanguageInput");
+    const streamContextInputEl = document.getElementById("streamContextInput");
+    const startStreamBtnEl = document.getElementById("startStreamBtn");
+    const stopStreamBtnEl = document.getElementById("stopStreamBtn");
+    const clearStreamBtnEl = document.getElementById("clearStreamBtn");
+    const streamStatusEl = document.getElementById("streamStatus");
+    const streamLanguageEl = document.getElementById("streamLanguage");
+    const committedTextEl = document.getElementById("committedText");
+    const liveTextEl = document.getElementById("liveText");
+    const streamJsonEl = document.getElementById("streamJson");
+
+    const TARGET_SR = 16000;
+    const CHUNK_MS = 500;
+
+    let streamSessionId = null;
+    let running = false;
+    let pushing = false;
+    let audioCtx = null;
+    let processor = null;
+    let source = null;
+    let mediaStream = null;
+    let buffer = new Float32Array(0);
+
+    function setStatus(el, message, kind = "") {
+      el.textContent = message;
+      el.className = `status ${kind}`.trim();
+    }
+
+    function scrollToBottom(el) {
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function concatFloat32(a, b) {
+      const out = new Float32Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    function resampleLinear(input, srcSr, dstSr) {
+      if (srcSr === dstSr) return input;
+      const ratio = dstSr / srcSr;
+      const outLen = Math.max(0, Math.round(input.length * ratio));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const x = i / ratio;
+        const x0 = Math.floor(x);
+        const x1 = Math.min(x0 + 1, input.length - 1);
+        const t = x - x0;
+        out[i] = input[x0] * (1 - t) + input[x1] * t;
+      }
+      return out;
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("读取音频文件失败"));
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function fetchInfo() {
+      const resp = await fetch("/api/info");
+      if (!resp.ok) throw new Error(await resp.text());
+      const data = await resp.json();
+      infoPillsEl.innerHTML = [
+        `<span class="pill">${data.service}</span>`,
+        `<span class="pill">model: ${data.model}</span>`,
+        `<span class="pill">backend: ${data.backend}</span>`,
+        `<span class="pill">transcribe: ${data.capabilities.transcribe}</span>`,
+        `<span class="pill">streaming: ${data.capabilities.streaming}</span>`
+      ].join("");
+      routesJsonEl.textContent = JSON.stringify(data.routes, null, 2);
+      infoJsonEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    function clearOfflineOutput() {
+      offlineLanguageEl.textContent = "";
+      offlineTextEl.textContent = "";
+      offlineJsonEl.textContent = "";
+    }
+
+    async function runTranscribe() {
+      clearOfflineOutput();
+      const file = fileInputEl.files[0];
+      if (!file) {
+        setStatus(transcribeStatusEl, "请先选择一个音频文件", "err");
+        return;
+      }
+
+      transcribeBtnEl.disabled = true;
+      setStatus(transcribeStatusEl, "正在上传并请求转录...", "");
+
+      try {
+        const audioDataUrl = await fileToDataUrl(file);
+        const payload = {
+          audio_data_url: audioDataUrl,
+          context: contextInputEl.value.trim(),
+          language: languageInputEl.value.trim()
+        };
+
+        const resp = await fetch("/api/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+
+        offlineLanguageEl.textContent = data.language || "(empty)";
+        offlineTextEl.textContent = data.text || "(empty)";
+        offlineJsonEl.textContent = JSON.stringify(data, null, 2);
+        setStatus(transcribeStatusEl, `完成，耗时 ${data.request_ms} ms`, "ok");
+      } catch (error) {
+        offlineJsonEl.textContent = String(error?.stack || error);
+        setStatus(transcribeStatusEl, error.message || String(error), "err");
+      } finally {
+        transcribeBtnEl.disabled = false;
+      }
+    }
+
+    function clearStreamOutput() {
+      streamLanguageEl.textContent = "";
+      committedTextEl.textContent = "";
+      liveTextEl.textContent = "";
+      streamJsonEl.textContent = "";
+    }
+
+    async function apiStreamStart() {
+      const resp = await fetch("/api/stream/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          context: streamContextInputEl.value.trim(),
+          language: streamLanguageInputEl.value.trim()
+        })
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json();
+    }
+
+    async function apiStreamChunk(float32_16k) {
+      const resp = await fetch("/api/stream/chunk?session_id=" + encodeURIComponent(streamSessionId), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: float32_16k.buffer
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json();
+    }
+
+    async function apiStreamFinish() {
+      const resp = await fetch("/api/stream/finish?session_id=" + encodeURIComponent(streamSessionId), {
+        method: "POST"
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json();
+    }
+
+    function renderStreamPayload(payload) {
+      streamLanguageEl.textContent = payload.language || "(empty)";
+      committedTextEl.textContent = payload.committed_text || "";
+      liveTextEl.textContent = payload.live_text || "";
+      streamJsonEl.textContent = JSON.stringify(payload, null, 2);
+      scrollToBottom(committedTextEl);
+      scrollToBottom(liveTextEl);
+    }
+
+    async function stopAudioPipeline() {
+      try {
+        if (processor) {
+          processor.disconnect();
+          processor.onaudioprocess = null;
+        }
+        if (source) source.disconnect();
+        if (audioCtx) await audioCtx.close();
+        if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+
+      processor = null;
+      source = null;
+      audioCtx = null;
+      mediaStream = null;
+    }
+
+    async function pumpStream() {
+      if (pushing) return;
+      pushing = true;
+      const chunkSamples = Math.round(TARGET_SR * (CHUNK_MS / 1000));
+
+      try {
+        while (running && buffer.length >= chunkSamples) {
+          const chunk = buffer.slice(0, chunkSamples);
+          buffer = buffer.slice(chunkSamples);
+          const payload = await apiStreamChunk(chunk);
+          renderStreamPayload(payload);
+          if (running) setStatus(streamStatusEl, "正在流式识别...", "ok");
+        }
+      } catch (error) {
+        setStatus(streamStatusEl, error.message || String(error), "err");
+      } finally {
+        pushing = false;
+      }
+    }
+
+    async function startStreaming() {
+      if (running) return;
+
+      clearStreamOutput();
+      buffer = new Float32Array(0);
+      startStreamBtnEl.disabled = true;
+
+      try {
+        setStatus(streamStatusEl, "正在初始化麦克风和会话...", "");
+        const startPayload = await apiStreamStart();
+        streamSessionId = startPayload.session_id;
+        renderStreamPayload(startPayload);
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        });
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        source = audioCtx.createMediaStreamSource(mediaStream);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (!running) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const resampled = resampleLinear(input, audioCtx.sampleRate, TARGET_SR);
+          buffer = concatFloat32(buffer, resampled);
+          if (!pushing) pumpStream();
+        };
+
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        running = true;
+        stopStreamBtnEl.disabled = false;
+        setStatus(streamStatusEl, "正在流式识别...", "ok");
+      } catch (error) {
+        setStatus(streamStatusEl, error.message || String(error), "err");
+        startStreamBtnEl.disabled = false;
+        running = false;
+        streamSessionId = null;
+        await stopAudioPipeline();
+      }
+    }
+
+    async function stopStreaming() {
+      if (!running) return;
+
+      running = false;
+      stopStreamBtnEl.disabled = true;
+      setStatus(streamStatusEl, "正在收尾最终结果...", "");
+      await stopAudioPipeline();
+
+      try {
+        if (streamSessionId) {
+          const payload = await apiStreamFinish();
+          renderStreamPayload(payload);
+        }
+        setStatus(streamStatusEl, "流式识别已结束", "ok");
+      } catch (error) {
+        setStatus(streamStatusEl, error.message || String(error), "err");
+      } finally {
+        streamSessionId = null;
+        buffer = new Float32Array(0);
+        pushing = false;
+        startStreamBtnEl.disabled = false;
+      }
+    }
+
+    transcribeBtnEl.addEventListener("click", runTranscribe);
+    clearTranscribeBtnEl.addEventListener("click", () => {
+      clearOfflineOutput();
+      fileInputEl.value = "";
+      setStatus(transcribeStatusEl, "");
+    });
+
+    startStreamBtnEl.addEventListener("click", startStreaming);
+    stopStreamBtnEl.addEventListener("click", stopStreaming);
+    clearStreamBtnEl.addEventListener("click", () => {
+      clearStreamOutput();
+      setStatus(streamStatusEl, running ? "正在流式识别..." : "");
+    });
+
+    fetchInfo().catch((error) => {
+      infoJsonEl.textContent = String(error?.stack || error);
+    });
+  </script>
+</body>
+</html>

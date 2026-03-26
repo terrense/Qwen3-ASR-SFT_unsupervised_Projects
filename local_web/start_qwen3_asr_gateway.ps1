@@ -1,6 +1,6 @@
 param(
     [string]$ImageTag = "qwenllm/qwen3-asr:latest",
-    [string]$ContainerName = "qwen3-asr-stream-custom",
+    [string]$ContainerName = "qwen3-asr-gateway",
     [string]$Model = "Qwen/Qwen3-ASR-0.6B",
     [int]$HostPort = 8003,
     [double]$GpuMemoryUtilization = 0.88,
@@ -18,14 +18,24 @@ if (-not (Test-Path $HfCache)) {
     New-Item -ItemType Directory -Force -Path $HfCache | Out-Null
 }
 
-$existing = docker ps -a --format "{{.Names}}" | Where-Object { $_ -eq $ContainerName }
-if ($existing) {
-    Write-Host "[docker] removing old container $ContainerName" -ForegroundColor Yellow
-    docker rm -f $ContainerName | Out-Null
+$legacyContainers = @(
+    $ContainerName,
+    "qwen3-asr-stream-custom",
+    "qwen3-asr-demo",
+    "qwen3-asr-local",
+    "qwen3-asr-stream"
+)
+
+$existing = docker ps -a --format "{{.Names}}"
+foreach ($name in $legacyContainers | Select-Object -Unique) {
+    if ($existing -contains $name) {
+        Write-Host "[docker] removing old container $name" -ForegroundColor Yellow
+        docker rm -f $name | Out-Null
+    }
 }
 
 $command = @(
-    "python", "/workspace/local_web/qwen3_streaming_stable_server.py",
+    "python", "/workspace/local_web/qwen3_asr_gateway.py",
     "--asr-model-path", $Model,
     "--gpu-memory-utilization", "$GpuMemoryUtilization",
     "--max-model-len", "$MaxModelLen",
@@ -56,6 +66,7 @@ Write-Host "[run] docker $($dockerArgs -join ' ')" -ForegroundColor Cyan
 docker @dockerArgs
 
 Write-Host ""
-Write-Host "Streaming demo should come up at: http://localhost:$HostPort" -ForegroundColor Green
+Write-Host "Unified gateway should come up at: http://localhost:$HostPort" -ForegroundColor Green
+Write-Host "Capability info: http://localhost:$HostPort/api/info" -ForegroundColor Green
 Write-Host "Follow logs with:" -ForegroundColor Green
 Write-Host "docker logs -f $ContainerName"
