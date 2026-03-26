@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qwen3-ASR Local Test</title>
+  <style>
+    :root {
+      --bg: #f6f4ee;
+      --panel: rgba(255, 255, 255, 0.9);
+      --text: #1e2430;
+      --muted: #5f6775;
+      --line: #d8d2c6;
+      --accent: #146c63;
+      --accent-2: #ef7d57;
+      --ok: #1f8a56;
+      --err: #b53b35;
+      --shadow: 0 18px 45px rgba(24, 28, 36, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(20, 108, 99, 0.15), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(239, 125, 87, 0.16), transparent 30%),
+        linear-gradient(180deg, #faf8f2 0%, var(--bg) 100%);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    .page {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 36px 20px 56px;
+    }
+
+    .hero {
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(20, 108, 99, 0.12);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 12px 0 10px;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.05;
+    }
+
+    .sub {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 380px minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(216, 210, 198, 0.9);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      padding: 20px;
+    }
+
+    .card h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    input[type="text"],
+    input[type="file"],
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font: inherit;
+      color: var(--text);
+      background: #fffdfa;
+    }
+
+    textarea {
+      min-height: 140px;
+      resize: vertical;
+      line-height: 1.6;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.08s ease, opacity 0.2s ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+    .primary {
+      background: linear-gradient(135deg, var(--accent), #0f8d7e);
+      color: white;
+    }
+
+    .ghost {
+      background: rgba(239, 125, 87, 0.12);
+      color: #9b4b32;
+    }
+
+    .status {
+      min-height: 22px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+
+    .result-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .result-block {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fffefb;
+      padding: 16px;
+    }
+
+    .result-block h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .hint {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px dashed var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 860px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="eyebrow">Local Windows Demo</span>
+      <h1>Qwen3-ASR 本地转录测试页</h1>
+      <div class="sub">
+        这个页面直接调用本机 Docker 里跑起来的 Qwen3-ASR OpenAI 风格接口。先启动服务，再在这里上传音频文件，页面会把本地文件转成 data URL 发给
+        <code>/v1/chat/completions</code>，用于快速看当前模型的原始转录表现。
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>请求配置</h2>
+        <div class="field">
+          <label for="endpoint">接口地址</label>
+          <input id="endpoint" type="text" value="http://localhost:8000/v1/chat/completions" />
+        </div>
+        <div class="field">
+          <label for="model">模型名</label>
+          <input id="model" type="text" value="Qwen/Qwen3-ASR-0.6B" />
+        </div>
+        <div class="field">
+          <label for="audioFile">音频文件</label>
+          <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg" />
+        </div>
+        <div class="actions">
+          <button id="runBtn" class="primary">开始转录</button>
+          <button id="clearBtn" class="ghost" type="button">清空结果</button>
+        </div>
+        <div id="status" class="status"></div>
+        <div class="hint">
+          建议先用较短的音频做联调。这个页面不走代理，浏览器会直接请求本机的 Qwen3-ASR 服务。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>返回结果</h2>
+        <div class="result-grid">
+          <div class="result-block">
+            <h3>解析后的语言</h3>
+            <pre id="parsedLanguage"></pre>
+          </div>
+          <div class="result-block">
+            <h3>解析后的文本</h3>
+            <pre id="parsedText"></pre>
+          </div>
+          <div class="result-block">
+            <h3>模型原始 content</h3>
+            <pre id="rawContent"></pre>
+          </div>
+          <div class="result-block">
+            <h3>完整 JSON 响应</h3>
+            <pre id="rawJson"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const endpointEl = document.getElementById("endpoint");
+    const modelEl = document.getElementById("model");
+    const audioFileEl = document.getElementById("audioFile");
+    const runBtn = document.getElementById("runBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const statusEl = document.getElementById("status");
+    const parsedLanguageEl = document.getElementById("parsedLanguage");
+    const parsedTextEl = document.getElementById("parsedText");
+    const rawContentEl = document.getElementById("rawContent");
+    const rawJsonEl = document.getElementById("rawJson");
+
+    function setStatus(message, kind = "") {
+      statusEl.textContent = message;
+      statusEl.className = `status ${kind}`.trim();
+    }
+
+    function resetOutputs() {
+      parsedLanguageEl.textContent = "";
+      parsedTextEl.textContent = "";
+      rawContentEl.textContent = "";
+      rawJsonEl.textContent = "";
+    }
+
+    function parseAsrContent(raw) {
+      const text = (raw || "").trim();
+      if (!text) {
+        return { language: "", text: "" };
+      }
+
+      const tag = "<asr_text>";
+      if (!text.includes(tag)) {
+        return { language: "", text };
+      }
+
+      const parts = text.split(tag);
+      const meta = parts.shift() || "";
+      const body = parts.join(tag).trim();
+      const match = meta.match(/language\s+([^\n<]+)/i);
+      let language = match ? match[1].trim() : "";
+      if (/language\s+none/i.test(meta) && !body) {
+        language = "";
+      }
+      return { language, text: body };
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("读取文件失败"));
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function runTranscription() {
+      resetOutputs();
+      const endpoint = endpointEl.value.trim();
+      const model = modelEl.value.trim();
+      const file = audioFileEl.files[0];
+
+      if (!endpoint) {
+        setStatus("请先填写接口地址。", "err");
+        return;
+      }
+      if (!model) {
+        setStatus("请先填写模型名。", "err");
+        return;
+      }
+      if (!file) {
+        setStatus("请先选择一个音频文件。", "err");
+        return;
+      }
+
+      runBtn.disabled = true;
+      setStatus("正在读取文件并请求本地 ASR 服务...", "");
+
+      try {
+        const dataUrl = await fileToDataUrl(file);
+        const payload = {
+          model,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "audio_url",
+                  audio_url: { url: dataUrl }
+                }
+              ]
+            }
+          ]
+        };
+
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await response.text();
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch (error) {
+          throw new Error(`接口没有返回 JSON。\nHTTP ${response.status}\n\n${text}`);
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}\n\n${JSON.stringify(json, null, 2)}`);
+        }
+
+        const content = json?.choices?.[0]?.message?.content ?? "";
+        const parsed = parseAsrContent(content);
+
+        parsedLanguageEl.textContent = parsed.language || "(empty)";
+        parsedTextEl.textContent = parsed.text || "(empty)";
+        rawContentEl.textContent = content || "(empty)";
+        rawJsonEl.textContent = JSON.stringify(json, null, 2);
+        setStatus("转录完成，可以直接看解析结果和原始返回。", "ok");
+      } catch (error) {
+        rawJsonEl.textContent = String(error?.stack || error);
+        setStatus(error.message || String(error), "err");
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener("click", runTranscription);
+    clearBtn.addEventListener("click", () => {
+      resetOutputs();
+      setStatus("");
+      audioFileEl.value = "";
+    });
+  </script>
+</body>
+</html>
