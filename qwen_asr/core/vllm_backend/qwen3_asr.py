@@ -138,6 +138,7 @@ def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
     # 中文学习备注：
     # vLLM 路径必须和 Transformers 路径共用同一套长度公式，
     # 否则 prompt 里展开的音频占位符数量会和 audio_tower 实际产出的 feature 数对不上。
+    # 这里的 `input_lengths` 同样是 mel 特征长度，而不是原始 waveform 采样点数。
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     output_lengths = (
@@ -175,6 +176,8 @@ class SinusoidsPositionEmbedding(nn.Module):
         self.register_buffer(
             "positional_embedding", positional_embedding, persistent=False
         )
+        # 中文学习备注：这里同样使用 register_buffer，
+        # 表示这是一块“跟着模型走、但不训练”的常量张量。
 
     def forward(self, seqlen: int) -> torch.Tensor:
         return self.positional_embedding[:seqlen, :]
@@ -214,6 +217,8 @@ class Qwen3ASRAudioAttention(nn.Module):
             bias=True,
             prefix=f"{prefix}.qkv",
         )
+        # 中文学习备注：vLLM 把 q/k/v 三个线性层合并成一个并行层，
+        # 这样更适合张量并行切分和高性能 kernel。
 
         self.out_proj = RowParallelLinear(
             input_size=self.embed_dim,
@@ -238,6 +243,10 @@ class Qwen3ASRAudioAttention(nn.Module):
         seq_length, _ = hidden_states.size()
         qkv, _ = self.qkv(hidden_states)
         q, k, v = qkv.chunk(3, dim=-1)
+        # 形状说明：
+        # hidden_states: (S_total, D_model)
+        # qkv:           (S_total, 3 * D_model)
+        # q/k/v:         (S_total, D_model)
         # vLLM's attention kernels expect (batch, seq, heads, head_dim). We use
         # a synthetic batch dimension of 1 because the sequences are already
         # packed with ``cu_seqlens``.
@@ -305,6 +314,7 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
+        # 形状始终是 (S_total, D_model)，只是语义上从原始音频表示逐层变成更抽象的语义表示。
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
@@ -315,6 +325,8 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states, _ = self.fc1(hidden_states)
+        # ColumnParallelLinear / RowParallelLinear 是 vLLM 为张量并行准备的线性层，
+        # 调用时通常会返回 `(output, bias_or_aux)`，所以这里会写成 `hidden_states, _ = ...`。
         hidden_states = self.activation_fn(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
@@ -375,6 +387,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
         conv_out_dim = config.downsample_hidden_size * (
             (((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2
         )
+        # 中文学习备注：这个公式和 HF 版同义，
+        # 表示频率维经过 3 次 stride=2 后的剩余长度，再乘通道数得到 flatten 长度。
         self.conv_out = nn.Linear(conv_out_dim, config.d_model, bias=False)
 
         # Transformer encoder layers
@@ -410,6 +424,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
     def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:
         """Compute max_seqlen only for flash attention backends."""
         # 中文学习备注：某些 FA backend 需要显式给出当前 batch 里最大的局部段长。
+        # 如果不是这些 backend，就返回 None，让下游忽略这个参数。
         max_seqlen = None
         if self.attn_backend in {
             AttentionBackendEnum.FLASH_ATTN,
@@ -420,10 +435,12 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
+        # 代理属性：直接以第一层卷积权重的 dtype 作为整座音频塔的 dtype。
         return self.conv2d1.weight.dtype
 
     @property
     def device(self) -> torch.device:
+        # 代理属性：默认认为整座塔都在 conv2d1 所在设备上。
         return self.conv2d1.weight.device
 
     def forward(
@@ -433,6 +450,9 @@ class Qwen3ASRAudioEncoder(nn.Module):
         aftercnn_lens: torch.Tensor,
     ):
         # 中文学习备注：这里复现的就是“长音频先切 chunk，再打包做局部 attention”的主流程。
+        # 输入/输出主形状：
+        # input_features:  (mel_bins, T_mel) 或与之兼容的单音频特征张量
+        # output:          (S_total_after_cnn, output_dim)
         # Compute chunk information
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -450,6 +470,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
         ).transpose(1, 2)
+        # 语法点：这里和 HF 版一样，是“先转置到时间优先，再按每块长度列表切块，再 pad 回 batch”。
 
         # Compute feature lengths after CNN
         feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
@@ -462,6 +483,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
         # Add channel dimension for conv2d
         padded_feature = padded_feature.unsqueeze(1)
+        # 形状从 (N_chunk, mel_bins, T) 变成 (N_chunk, 1, mel_bins, T)，以适配 Conv2d。
 
         # Apply convolutional layers (chunk if needed to avoid OOM)
         if padded_feature.size(0) <= self.conv_chunksize:
@@ -481,6 +503,10 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
         # (batch, channels, freq, time) -> (batch, time, channels*freq)
         b, c, f, t = padded_embed.size()
+        # 中文学习备注：这里的 `permute(...).contiguous().view(...)` 是典型 PyTorch 形状重排套路：
+        # - `permute` 只改维度顺序
+        # - `contiguous` 确保内存连续
+        # - `view` 才能安全 reshape
         padded_embed = self.conv_out(
             padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
         )
@@ -495,6 +521,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
         # Extract valid hidden states and compute cu_seqlens
         hidden_states = padded_embed[padded_mask_after_cnn]
+        # 这一步会把 (N_chunk, T', D_model) 压缩成 (所有有效帧总数, D_model)。
 
         # Compute cumulative sequence lengths for chunked attention. These mark
         # the ragged boundaries after convolutional downsampling.
@@ -535,6 +562,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
     def _get_cnn_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
         """Compute output lengths after the three conv2d layers."""
+        # 中文学习备注：这是长度公式的“朴素循环版”，和上面那个闭式公式本质等价。
         lengths = input_lengths
         for _ in range(3):
             lengths = (lengths - 1) // 2 + 1
@@ -564,6 +592,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # `for ... else` 语法点：
+                # 只有当上面的 for 循环没有被 `break` 命中时，才会进入这里。
                 param = params_dict.get(name)
                 if param is not None:
                     weight_loader = getattr(
@@ -580,6 +610,7 @@ class Qwen3ASRProcessingInfo(BaseProcessingInfo):
     # 它告诉 vLLM：这个模型对应哪个 HF config、哪个 processor、支持什么模态。
 
     def get_hf_config(self):
+        # 直接把最外层 Qwen3ASRConfig 里的 thinker_config 拿出来给 vLLM 用。
         return self.ctx.get_hf_config(Qwen3ASRConfig).thinker_config
 
     def get_hf_processor(self, **kwargs: object) -> Qwen3ASRProcessor:
@@ -589,12 +620,14 @@ class Qwen3ASRProcessingInfo(BaseProcessingInfo):
             **kwargs,
         )
         if not hasattr(processor, "audio_token"):
+            # 某些 processor 版本里可能没有显式挂这个字段，所以这里做兜底。
             processor.audio_token = "<|audio_pad|>"
         return processor
 
     def get_feature_extractor(self, **kwargs: object) -> WhisperFeatureExtractor:
         hf_processor = self.get_hf_processor(**kwargs)
         feature_extractor = hf_processor.feature_extractor
+        # `assert isinstance(...)` 在这里既是运行时检查，也相当于给后续类型推断一个提示。
         assert isinstance(feature_extractor, WhisperFeatureExtractor)
         return feature_extractor
 
@@ -614,6 +647,8 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
         audio_token = hf_processor.audio_token
 
         return audio_token * num_audios
+        # 中文学习备注：这里故意返回重复的音频占位符字符串，
+        # 让 profiling 阶段也能走到多模态 prompt 替换逻辑。
 
     def get_dummy_mm_data(
         self,
@@ -632,6 +667,7 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
             )
             * feature_extractor.sampling_rate
         )
+        # 中文学习备注：profiling 时不一定需要超长音频，取一个“够代表性但不太大”的长度即可。
 
         audio_overrides = mm_options.get("audio") if mm_options else None
 
@@ -667,6 +703,7 @@ class Qwen3ASRMultiModalDataParser(MultiModalDataParser):
         data: dict[str, torch.Tensor] | ModalityData[AudioItem],
     ) -> ModalityDataItems[Any, Any] | None:
         if isinstance(data, dict):
+            # 中文学习备注：如果上游已经给了现成的特征字典，就直接包装，不再重新提特征。
             return DictEmbeddingItems(
                 data,
                 modality="audio",
@@ -709,6 +746,7 @@ class Qwen3ASRMultiModalProcessor(
         # 中文学习备注：
         # vLLM 路径里，“一个音频占位符到底要扩成多少个序列位置”就是在这里显式决定的。
         # 数量必须和 audio_tower 产出的 feature 数一模一样，否则后面 embedding 合并会报 shape 错。
+        # 这一步非常关键，因为 vLLM 的文本 token 规划和 multimodal embedding 注入是分开的。
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
         vocab = tokenizer.get_vocab()
@@ -730,6 +768,8 @@ class Qwen3ASRMultiModalProcessor(
                 feature_attention_mask.sum(-1)
             )
             audio_output_lengths = audio_output_lens.tolist()
+        # 中文学习备注：最终得到的是一个 Python list，
+        # 每个元素表示“第 i 条音频要展开成多少个 placeholder token”。
 
         def get_replacement_qwen2_audio(item_idx: int):
             num_features = audio_output_lengths[item_idx]
@@ -771,6 +811,8 @@ class Qwen3ASRForConditionalGeneration(
     # 中文学习备注：
     # 这是 vLLM 世界里的顶层模型类。
     # 你可以把它理解成“HF 版 ThinkerForConditionalGeneration 的 vLLM 适配壳”。
+    # 上面的 `@MULTIMODAL_REGISTRY.register_processor(...)` 是注册 decorator：
+    # 它会把这个模型类和对应的 processor/info/dummy builder 绑定进 vLLM 的多模态注册表。
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -784,6 +826,8 @@ class Qwen3ASRForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
             return "<|audio_start|><|audio_pad|><|audio_end|>"
+        # 中文学习备注：这里返回的是“一个逻辑音频块”的外层占位符模板，
+        # 真正扩成多少个 `<|audio_pad|>` 位置要到 processor 那边才知道。
 
         raise ValueError("Only audio modality is supported")
 
@@ -837,6 +881,7 @@ class Qwen3ASRForConditionalGeneration(
             audio_feature_lengths=audio_feature_lengths,
             feature_attention_mask=feature_attention_mask,
         )
+        # 语法点：这里虽然写起来像 dict，但返回的是一个带类型约束的结构化对象。
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         # 中文学习备注：当前模型只关心 audio 模态，但仍然遵守 vLLM 的统一多模态入口格式。
@@ -873,6 +918,7 @@ class Qwen3ASRForConditionalGeneration(
             aftercnn_lens=audio_output_lengths,
         )
         return audio_features.split(audio_output_lengths.tolist())
+        # 中文学习备注：`.split(lengths)` 会把一条总 embedding 序列切回“每条音频自己的那一段”。
 
     def get_language_model(self) -> torch.nn.Module:
         # 中文学习备注：vLLM 上层有时只关心“文本模型部分”。
@@ -894,6 +940,7 @@ class Qwen3ASRForConditionalGeneration(
         # The result multimodal_embeddings is tuple of tensors, with each
         # tensor correspoending to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
+        # 语法点：这里故意用 tuple 累积，是为了贴合 vLLM 对 MultiModalEmbeddings 的接口约定。
 
         # NOTE: It is important to iterate over the keys in this dictionary
         # to preserve the order of the modalities.
@@ -921,6 +968,7 @@ class Qwen3ASRForConditionalGeneration(
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
+        # 中文学习备注：如果当前请求没有多模态输入，这里就退化成纯文本 embedding 路径。
 
         # Merge audio embeddings into the placeholder token positions computed by
         # vLLM's multimodal planner.
@@ -945,6 +993,7 @@ class Qwen3ASRForConditionalGeneration(
         # 中文学习备注：真正的前向大多已经在 embedding 合并阶段准备好了；
         # 这里主要是把合成后的输入交给 Qwen3 文本模型。
         if intermediate_tensors is not None:
+            # 中文学习备注：pipeline parallel / 分段执行时，中间张量优先级高于外部传入的 inputs_embeds。
             inputs_embeds = None
 
         hidden_states = self.language_model.model(
@@ -994,6 +1043,7 @@ class Qwen3ASRForConditionalGeneration(
                 torch.arange(seq_len, dtype=torch.long).view(1, -1).expand(3, -1)
             )
             return llm_positions.clone(), 0
+        # 中文学习备注：没有音频时，多模态位置就退化成普通从 0 到 S-1 的线性位置。
 
         llm_pos_ids_list: list[torch.Tensor] = []
         st = 0
@@ -1018,6 +1068,7 @@ class Qwen3ASRForConditionalGeneration(
                 torch.arange(text_len, dtype=torch.long).view(1, -1).expand(3, -1)
                 + st_idx
             )
+            # 中文学习备注：这里的 `st_idx` 保证位置编号在整个混合序列上单调递增。
             llm_pos_ids_list.append(text_positions)
             st_idx = st_idx + text_len
 
@@ -1045,6 +1096,7 @@ class Qwen3ASRForConditionalGeneration(
             raise RuntimeError("Position ids length mismatch with input ids length")
 
         mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+        # 这个 delta 表示“多模态展开后的位置上界”和“原始 token 长度”之间的偏差。
         return llm_positions, mrope_position_delta
 
     def get_mm_mapping(self) -> MultiModelKeys:
@@ -1114,4 +1166,6 @@ class Qwen3ASRForConditionalGeneration(
             "prompt_token_ids": prompt_token_ids,
             "multi_modal_data": {"audio": audio},
         }
+        # 中文学习备注：返回值不是纯 token 列表，而是一个 prompt dict：
+        # 文本 token 和多模态原始数据会被一起交给 vLLM 的 planner。
         return cast(PromptType, prompt_dict)

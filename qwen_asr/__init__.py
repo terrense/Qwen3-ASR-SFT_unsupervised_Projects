@@ -26,8 +26,11 @@ symbols imported here.
 """
 
 from .inference.qwen3_asr import Qwen3ASRModel
-from .inference.qwen3_forced_aligner import Qwen3ForcedAligner
-
 from .inference.utils import parse_asr_output
 
-__all__ = ["__version__"]
+try:
+    from .inference.qwen3_forced_aligner import Qwen3ForcedAligner
+except Exception:
+    Qwen3ForcedAligner = None  # type: ignore[assignment]
+
+__all__ = ["Qwen3ASRModel", "Qwen3ForcedAligner", "parse_asr_output"]

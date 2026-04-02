@@ -819,10 +819,15 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         self._requires_grad = False
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.conv1
+        # 中文学习备注：
+        # 音频塔没有词表 embedding，这里按 HF 约定返回“最靠前的输入映射层”。
+        # 对本模型来说，就是第一层卷积 conv2d1。
+        return self.conv2d1
 
     def set_input_embeddings(self, value: nn.Module):
-        self.conv1 = value
+        # 中文学习备注：与 `get_input_embeddings` 对应，外部如果要替换输入映射层，
+        # 实际替换的是第一层卷积。
+        self.conv2d1 = value
 
     def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         # Flash Attention 2 doesn't need a 4D mask and relies on `cu_seqlens/max_seqlen`
@@ -848,10 +853,10 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        input_features,
-        feature_lens=None,
-        aftercnn_lens=None,
-    ):
+        input_features: torch.Tensor,
+        feature_lens: Optional[torch.LongTensor] = None,
+        aftercnn_lens: Optional[torch.LongTensor] = None,
+    ) -> BaseModelOutput:
         r"""
         feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length
@@ -871,7 +876,10 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         # The encoder processes long audio as several fixed-size windows. This
         # keeps convolution and attention memory bounded while still letting us
         # concatenate the resulting hidden states into one long sequence.
-        aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+        if feature_lens is None:
+            raise ValueError("`feature_lens` must be provided for the audio encoder forward pass.")
+        if aftercnn_lens is None:
+            aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
         # 每条音频会被拆成多少个基础 chunk。
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -885,8 +893,12 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             device=feature_lens.device,
         )
         tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        # 中文学习备注：
+        # `tail_chunk_index` 的作用是定位“每条音频最后一个 chunk”在全局 chunk 列表中的位置。
+        # 这样就能把尾块长度改成真实余数，而不是默认满块长度。
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+        # 如果刚好整除，余数会是 0，这里要把它恢复成满块长度。
 
         # ``input_features`` arrives as (mel_bins, time). Splitting along the
         # transposed time axis yields a Python list of variable-length windows.
@@ -910,6 +922,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         # sequence because windows were already split above.
         padded_embeds = []
         for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+            # 中文学习备注：
+            # 这里的 `.split(self.conv_chunksize, dim=0)` 不是时间切块，
+            # 而是把“chunk batch”再按 batch 维分成若干小批，纯粹为了省显存。
             padded_embed = F.gelu(self.conv2d1(chunk))
             padded_embed = F.gelu(self.conv2d2(padded_embed))
             padded_embed = F.gelu(self.conv2d3(padded_embed))
@@ -931,6 +946,8 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             .to(padded_embed.dtype)
         )
         padded_embed = padded_embed + positional_embedding
+        # 中文学习备注：这里的位置编码是“每个 chunk 内独立按时间位置加”的。
+        # 因为后面真正控制 chunk 边界语义的是 packed 序列和 cu_seqlens。
         # ``padded_embed`` is batch-major, but varlen attention prefers a packed
         # representation plus cumulative sequence lengths.
         hidden_states = padded_embed[padded_mask_after_cnn]
@@ -961,6 +978,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
 
             hidden_states = layer_outputs[0]
         # 中文学习备注：每层都在同一条 packed 序列上做块内双向注意力。
+        # 从数学上说，每一层都保持：
+        # hidden_states shape = (S_total_after_cnn, D_model)
+        # 但语义表示逐层更抽象。
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
@@ -1041,7 +1061,7 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
         # 因为它可以由 config 重新计算出来。
         self.original_inv_freq = self.inv_freq
 
-        self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
+        self.mrope_section = (config.rope_scaling or {}).get("mrope_section", [24, 20, 20])
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """Apply interleaved MRoPE to 3D rotary embeddings.
@@ -1254,7 +1274,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -1267,7 +1287,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
-        # `@check_model_inputs()` 是 HF 的输入校验 decorator；
+        # `@check_model_inputs` 是 HF 的输入校验 decorator；
         # 它会在 forward 前帮你检查 mutually exclusive 的输入组合等问题。
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1407,10 +1427,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 The length of feature shape of each audio in LLM.
         """
         if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            feature_lens = torch.sum(feature_attention_mask, dim=1)
+        elif audio_feature_lengths is not None:
+            feature_lens = audio_feature_lengths
         else:
-            audio_feature_lengths = None
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+            raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
         # 中文学习备注：
         # 这里有一个接口层兼容写法：既支持显式给长度，也支持从 mask 里现算长度。
     
@@ -1468,19 +1489,19 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
     @auto_docstring
     def forward(
         self,
-        input_ids=None,
-        input_features=None,
-        attention_mask=None,
-        feature_attention_mask=None,
-        audio_feature_lengths=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        rope_deltas=None,
-        labels=None,
-        use_cache=None,
-        cache_position=None,
-        **kwargs,
+        input_ids: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        feature_attention_mask: Optional[torch.LongTensor] = None,
+        audio_feature_lengths: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, Qwen3ASRThinkerCausalLMOutputWithPast]:
         r"""
         feature_attention_mask (`torch.Tensor` of shape `(batch_size, feature_sequence_length)`, *optional*):
@@ -1498,12 +1519,16 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         """
 
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("You must provide `input_ids` when `inputs_embeds` is not supplied.")
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
             # 中文学习备注：此时还是“纯文本占位符 embedding”视角。
 
         # 2. Merge text, audios
         if input_features is not None:
+            if input_ids is None:
+                raise ValueError("`input_ids` are required when injecting audio features into placeholder tokens.")
             audio_features = self.get_audio_features(
                 input_features,
                 feature_attention_mask=feature_attention_mask,
@@ -1518,6 +1543,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             # audio_mask 展开后为 (B, S, H_model)
             # audio_features 需要能按这个 mask 展平后的元素数刚好填满对应位置
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+            # 中文学习备注：
+            # 从这一步开始，后面的文本 decoder 已经“不知道自己在看音频占位符”了，
+            # 它只看到一段普通的 embedding 序列，其中部分位置来自 audio encoder。
 
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
@@ -1559,6 +1587,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             cache_position=cache_position,
             **kwargs,
         )
+        # 中文学习备注：
+        # 这里不再传 `input_ids`，而是直接传 `inputs_embeds`。
+        # 原因很简单：音频已经被注入 embedding 级别，无法再用离散 token id 表达。
 
         hidden_states = outputs[0]
         # 中文学习备注：到这里为止，audio 信息已经完全混进 hidden_states 里了，
@@ -1584,17 +1615,17 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
     def prepare_inputs_for_generation(
         self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        position_ids=None,
-        use_cache=True,
-        input_features=None,
-        feature_attention_mask=None,
-        **kwargs,
-    ):
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = True,
+        input_features: Optional[torch.FloatTensor] = None,
+        feature_attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> dict[str, object]:
         # 中文学习备注：生成阶段的关键优化在这里：
         # 第一步需要音频特征；后续 token 续写只靠文本侧 KV cache，不必重复编码整段音频。
         # 这也是“重用同一份音频上下文”的关键，否则 streaming/offline 每步都会重复跑 audio_tower。
@@ -1615,7 +1646,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         # multimodal offsets rather than only on the current token slice.
         model_inputs["position_ids"] = None
 
-        if cache_position[0] != 0:
+        if cache_position is not None and cache_position[0] != 0:
             # Audio features are only needed on the first decoding step. Later
             # steps read from the text-side KV cache.
             model_inputs["input_features"] = None

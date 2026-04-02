@@ -1,4 +1,6 @@
 # coding=utf-8
+from __future__ import annotations
+
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -46,7 +48,14 @@ AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
 AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)
 AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
 
-from .qwen3_forced_aligner import Qwen3ForcedAligner
+# Forced aligner is optional. Keep ASR importable even when its language-
+# specific dependency stack (e.g. `nagisa`) is not installed.
+try:
+    from .qwen3_forced_aligner import Qwen3ForcedAligner
+    _FORCED_ALIGNER_IMPORT_ERROR = None
+except Exception as _exc:
+    Qwen3ForcedAligner = None  # type: ignore[assignment]
+    _FORCED_ALIGNER_IMPORT_ERROR = _exc
 from .utils import (
     MAX_ASR_INPUT_SECONDS,
     MAX_FORCE_ALIGN_INPUT_SECONDS,
@@ -236,6 +245,11 @@ class Qwen3ASRModel:
 
         forced_aligner_model = None
         if forced_aligner is not None:
+            if Qwen3ForcedAligner is None:
+                raise ImportError(
+                    "Forced aligner dependencies are not available. "
+                    "Install optional dependencies required by `qwen3_forced_aligner.py`."
+                ) from _FORCED_ALIGNER_IMPORT_ERROR
             forced_aligner_model = Qwen3ForcedAligner.from_pretrained(
                 forced_aligner, **(forced_aligner_kwargs or {})
             )
@@ -300,6 +314,11 @@ class Qwen3ASRModel:
 
         forced_aligner_model = None
         if forced_aligner is not None:
+            if Qwen3ForcedAligner is None:
+                raise ImportError(
+                    "Forced aligner dependencies are not available. "
+                    "Install optional dependencies required by `qwen3_forced_aligner.py`."
+                ) from _FORCED_ALIGNER_IMPORT_ERROR
             forced_aligner_model = Qwen3ForcedAligner.from_pretrained(
                 forced_aligner, **(forced_aligner_kwargs or {})
             )

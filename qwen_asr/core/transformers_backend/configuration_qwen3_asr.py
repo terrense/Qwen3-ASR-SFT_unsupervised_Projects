@@ -134,6 +134,11 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # 中文学习备注：
+        # 这里看起来只是“把参数存起来”，但配置类的意义其实比普通 dataclass 更强：
+        # 1. 会被 HF 自动写进 config.json
+        # 2. 会驱动 `_from_config(...)` 创建真实模型
+        # 3. 会被下游推理框架（例如 vLLM）读取并重建等价结构
 
         self.num_mel_bins = num_mel_bins
         self.d_model = d_model
@@ -269,6 +274,12 @@ class Qwen3ASRTextConfig(PretrainedConfig):
     # 这里定义的是文本 decoder 的超参，基本就是一个 Qwen 风格 causal decoder。
     # 真正做 ASR 时，它看到的输入并不只是纯文本 token embedding，
     # 还会混入音频塔输出的连续 audio embeddings。
+    #
+    # 这些字段和张量形状直接相关：
+    # - hidden_size：每个 token 的隐藏维
+    # - num_attention_heads：Q 头数
+    # - num_key_value_heads：K/V 头数，决定是否启用 GQA/MQA
+    # - head_dim：每个头的维度，通常满足 hidden_size = num_attention_heads * head_dim
 
     def __init__(
         self,
@@ -291,6 +302,9 @@ class Qwen3ASRTextConfig(PretrainedConfig):
         attention_dropout=0.0,
         **kwargs,
     ):
+        # 中文学习备注：
+        # 这里没有先 `super().__init__()` 再赋值，而是先把字段写好，再调父类。
+        # 这是 HF 配置类里很常见的写法，因为父类初始化时就可能读取这些字段。
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -301,6 +315,7 @@ class Qwen3ASRTextConfig(PretrainedConfig):
         # Older checkpoints may omit ``num_key_value_heads``. Falling back to
         # full multi-head attention keeps those configs loadable.
         if num_key_value_heads is None:
+            # 中文学习备注：这里等价于“退化成普通多头注意力 MHA”。
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
@@ -316,6 +331,7 @@ class Qwen3ASRTextConfig(PretrainedConfig):
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
+            # 中文学习备注：这是做老 checkpoint 向后兼容。
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -386,6 +402,7 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         super().__init__(**kwargs)
         # 中文学习备注：Thinker 是真正把“音频塔 + 文本 decoder”捆在一起的那一层。
         # 后面在 modeling_qwen3_asr.py 里看到的 audio_tower / model，就是从这里分出来的。
+        # 你可以把它理解成“一个组合配置对象”，而不是单一子网络配置。
         self.user_token_id = user_token_id
         self.audio_start_token_id = audio_start_token_id
         self.initializer_range = initializer_range
@@ -394,6 +411,7 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         # so downstream code can rely on attribute access rather than dictionary
         # lookups.
         if isinstance(audio_config, dict):
+            # 中文学习备注：允许从原始 dict 直接恢复成强类型配置对象。
             audio_config = Qwen3ASRAudioEncoderConfig(**audio_config)
         elif audio_config is None:
             audio_config = Qwen3ASRAudioEncoderConfig()
@@ -460,6 +478,8 @@ class Qwen3ASRConfig(PretrainedConfig):
         super().__init__(**kwargs)
         if thinker_config is None:
             thinker_config = {}
+        # 中文学习备注：顶层配置允许直接传一个 dict 进来，
+        # 内部再把它包装成 Qwen3ASRThinkerConfig。
 
         # The top-level config mostly delegates architectural detail to the
         # nested thinker config, while keeping model-wide metadata such as the
@@ -483,6 +503,7 @@ class Qwen3ASRConfig(PretrainedConfig):
         # added. NOTE: currently method used only by vLLM
         # 中文学习备注：vLLM 常常需要“给我文本 decoder 的配置”而不是整个 ASR wrapper，
         # 所以这里提供一个统一入口把它取出来。
+        # 这也是“组合模型配置”和“单塔配置”之间最常见的桥接方法之一。
         return self.thinker_config.get_text_config()
 
 

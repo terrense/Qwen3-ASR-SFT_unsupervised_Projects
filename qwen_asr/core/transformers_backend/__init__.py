@@ -22,6 +22,15 @@ paths in the inference wrapper while still preserving a layered project
 structure.
 """
 
+# 中文学习备注：
+# 这个文件本身不做任何模型计算，它只是把 transformers backend 里最核心的三件东西统一导出：
+# 1. Config：定义整体结构和关键超参
+# 2. Processor：负责 waveform/text -> 模型输入
+# 3. Model：负责 audio encoder + thinker decoder 的真正前向与生成
+#
+# 也就是说，如果你把 `qwen_asr/core/transformers_backend` 当成一个小子系统，
+# 这个 `__init__.py` 就是它对外暴露的最小 API 面。
+
 from .configuration_qwen3_asr import Qwen3ASRConfig
 from .modeling_qwen3_asr import Qwen3ASRForConditionalGeneration
 from .processing_qwen3_asr import Qwen3ASRProcessor
