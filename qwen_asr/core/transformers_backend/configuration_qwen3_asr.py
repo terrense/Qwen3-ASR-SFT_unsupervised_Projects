@@ -33,6 +33,17 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+# 中文学习备注：
+# 这份文件不是简单的“默认参数表”，而是在描述 Qwen3-ASR 的整体拓扑。
+# 读它时建议先分三层看：
+# 1. AudioEncoderConfig：音频塔怎么把 Fbank 压成 audio features
+# 2. TextConfig：文本 decoder 怎么生成结果
+# 3. Thinker/Top-level Config：怎么把前两者绑成一个多模态 ASR 模型
+#
+# 建议阅读顺序：
+# 1. 先看 Qwen3ASRAudioEncoderConfig，弄清音频塔有哪些关键参数
+# 2. 再看 Qwen3ASRTextConfig，确认文本 decoder 的 hidden/head/rope 设置
+# 3. 最后看 Qwen3ASRThinkerConfig / Qwen3ASRConfig，理解模块是怎么拼起来的
 class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3ASRAudioEncoder`]. It is used to instantiate a
@@ -93,6 +104,13 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen3_asr_audio_encoder"
+    # 中文学习备注：
+    # 这个类描述的是“音频塔”本身，不包含文本 decoder。
+    # 你可以把它理解成：
+    #   128 维 Fbank
+    #   -> 3 层 stride=2 Conv2d
+    #   -> Audio Transformer
+    #   -> 投影成 output_dim 维的 audio features
 
     def __init__(
         self,
@@ -132,10 +150,15 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
         self.max_source_positions = max_source_positions
+        # 中文学习备注：编码时会先按 `n_window * 2` 切 mel 帧，再做卷积和局部 attention。
         self.n_window = n_window
         self.output_dim = output_dim
+        # 中文学习备注：
+        # `n_window_infer` 决定卷积后 attention 的推理窗口大小；
+        # `conv_chunksize` 只是卷积阶段的防 OOM 分段大小，不改变最终数学结果。
         self.n_window_infer = n_window_infer
         self.conv_chunksize = conv_chunksize
+        # 中文学习备注：这是 3 层 stride=2 Conv2d 的通道宽度。
         self.downsample_hidden_size = downsample_hidden_size
 
 
@@ -242,6 +265,10 @@ class Qwen3ASRTextConfig(PretrainedConfig):
 
     model_type = "qwen3_asr_text"
     base_config_key = "text_config"
+    # 中文学习备注：
+    # 这里定义的是文本 decoder 的超参，基本就是一个 Qwen 风格 causal decoder。
+    # 真正做 ASR 时，它看到的输入并不只是纯文本 token embedding，
+    # 还会混入音频塔输出的连续 audio embeddings。
 
     def __init__(
         self,
@@ -336,6 +363,9 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen3_asr_thinker"
+    # 中文学习备注：
+    # Thinker 这一层最关键，因为它第一次把 audio_config 和 text_config 放进同一个配置对象里。
+    # 后面模型初始化时，audio_tower 和 text model 都是从这里拆出来的。
 
     attribute_map = {}
     sub_configs = {
@@ -354,6 +384,8 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # 中文学习备注：Thinker 是真正把“音频塔 + 文本 decoder”捆在一起的那一层。
+        # 后面在 modeling_qwen3_asr.py 里看到的 audio_tower / model，就是从这里分出来的。
         self.user_token_id = user_token_id
         self.audio_start_token_id = audio_start_token_id
         self.initializer_range = initializer_range
@@ -372,6 +404,8 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         elif text_config is None:
             text_config = Qwen3ASRTextConfig()
         self.text_config = text_config
+        # 中文学习备注：prompt 里的音频占位符最终会落到这个 token id 上，
+        # 后续再由 audio features 覆盖这些位置的 embedding。
         self.audio_token_id = audio_token_id
 
 
@@ -410,6 +444,9 @@ class Qwen3ASRConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen3_asr"
+    # 中文学习备注：
+    # 这是最外层 wrapper config。它不自己定义大量结构细节，
+    # 而是把结构主体继续委托给 thinker_config。
     sub_configs = {
         "thinker_config": Qwen3ASRThinkerConfig,
     }
@@ -427,6 +464,8 @@ class Qwen3ASRConfig(PretrainedConfig):
         # The top-level config mostly delegates architectural detail to the
         # nested thinker config, while keeping model-wide metadata such as the
         # supported language list.
+        # 中文学习备注：顶层 config 本身并不展开音频塔和文本塔的全部细节，
+        # 而是把绝大多数结构信息继续下放给 thinker_config。
         self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
         self.support_languages = support_languages
 
@@ -442,6 +481,8 @@ class Qwen3ASRConfig(PretrainedConfig):
         # Overridden for deeply nested config like Qwen2.5-Omni. We don't have any omni model
         # except for Qwen yet. This has to be generalized if more deeply nested configs are
         # added. NOTE: currently method used only by vLLM
+        # 中文学习备注：vLLM 常常需要“给我文本 decoder 的配置”而不是整个 ASR wrapper，
+        # 所以这里提供一个统一入口把它取出来。
         return self.thinker_config.get_text_config()
 
 

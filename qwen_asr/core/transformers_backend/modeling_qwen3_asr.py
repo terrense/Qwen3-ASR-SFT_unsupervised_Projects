@@ -63,9 +63,26 @@ from .configuration_qwen3_asr import (
     Qwen3ASRThinkerConfig,
 )
 
+# 中文学习备注：这份文件可以粗分成四段来读。
+# 1. 通用文本侧积木：RMSNorm / attention / MLP / decoder layer
+# 2. 通用多模态辅助函数：长度公式、RoPE 位置、causal mask 等
+# 3. 音频塔：Qwen3ASRAudioEncoder 及其 attention/layer
+# 4. Thinker 与顶层 wrapper：把 audio features 注入文本序列并做生成
+#
+# 如果你第一次学，建议按下面顺序：
+# `_get_feat_extract_output_lengths`
+# -> `Qwen3ASRAudioEncoder.forward`
+# -> `Qwen3ASRThinkerForConditionalGeneration.get_audio_features`
+# -> `get_placeholder_mask`
+# -> `masked_scatter`
+
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3ASRTextRMSNorm(nn.Module):
+    # 中文学习备注：这是文本侧用的 RMSNorm。
+    # 它和 LayerNorm 的区别是只按方差归一化，不做均值中心化。
+    # `@use_kernel_forward_from_hub("RMSNorm")` 是 Hugging Face 的一个优化钩子：
+    # 如果运行环境里有更快的同名 kernel，可以在不改调用代码的前提下替换 forward 实现。
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """
         Qwen3ASRTextRMSNorm is equivalent to T5LayerNorm
@@ -75,8 +92,14 @@ class Qwen3ASRTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 形状说明：
+        # hidden_states: (..., hidden_size)
+        # variance:      (..., 1)
+        # return:        (..., hidden_size)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
+        # RMSNorm 核心公式：
+        # y = x / sqrt(mean(x^2) + eps) * weight
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
@@ -87,8 +110,13 @@ class Qwen3ASRTextRMSNorm(nn.Module):
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
+    # 中文学习备注：RoPE 在实数张量里可以理解成“半边互换 + 一侧取负”。
     # RoPE can be written as a complex-number rotation. In real tensor form that
     # becomes "swap the two half-vectors and negate one side".
+    # 形状说明：
+    # x: (..., head_dim)
+    # x1/x2: (..., head_dim/2)
+    # return: (..., head_dim)
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -104,6 +132,16 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     # ``expand`` avoids materializing copies immediately; the reshape then gives
     # the logical view expected by grouped-query attention.
+    # 中文学习备注：GQA/MQA 下，K/V 头数可能小于 Q 头数；
+    # 这里负责把较少的 K/V 头“逻辑上复制”成 attention 所需的头数。
+    # 语法点：
+    # `[:, :, None, :, :]` 会在第 3 维插入一个长度为 1 的新轴；
+    # `expand` 不会真的复制数据，而是返回一个带 broadcast 语义的 view。
+    # 形状变化：
+    # (B, H_kv, S, D)
+    # -> (B, H_kv, 1, S, D)
+    # -> (B, H_kv, n_rep, S, D)
+    # -> (B, H_kv * n_rep, S, D)
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
@@ -125,9 +163,20 @@ def eager_attention_forward(
     attention dispatch utilities, which allows the same module code to work with
     eager attention, SDPA and FlashAttention backends.
     """
+    # 中文学习备注：这是最朴素的 PyTorch attention 实现。
+    # 它的价值主要不是快，而是给所有后端提供一个统一的“保底语义”。
+    # 输入形状约定：
+    # query: (B, H_q, S_q, D)
+    # key:   (B, H_kv, S_k, D)
+    # value: (B, H_kv, S_k, D)
+    # 输出：
+    # attn_output:  (B, S_q, H_q, D) 在 transpose 后再交给上层 reshape
+    # attn_weights: (B, H_q, S_q, S_k)
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # 注意力核心公式：
+    # softmax(Q K^T / sqrt(D) + mask) V
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -161,6 +210,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # 中文学习备注：RoPE 只作用在 Q/K 上，不作用在 V 上。
+    # 形状说明：
+    # q, k:   (B, H, S, D) 或其他与 `unsqueeze_dim` 匹配的排列
+    # cos/sin 原始通常是 (B, S, D) 或 (S, D)
+    # 通过 unsqueeze 后变成可 broadcast 到 q/k 的形状
+    #
+    # 数学上相当于把每两个维度看成一个复数平面，然后按位置相关的角度做旋转。
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -170,9 +226,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 class Qwen3ASRTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    # 中文学习备注：这是文本 decoder 侧的 attention，不是音频 encoder 侧的 attention。
+    # 文本侧是 causal attention，要保证生成时只能看见当前位置之前的 token。
 
     def __init__(self, config: Qwen3ASRConfig, layer_idx: int):
         super().__init__()
+        # 语法点：`getattr(config, "head_dim", fallback)` 表示如果 config 里没有 head_dim，
+        # 就退回到 hidden_size // num_attention_heads 这个默认计算值。
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -210,6 +270,9 @@ class Qwen3ASRTextAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # 语法点：
+        # `tuple[torch.Tensor, torch.Tensor]` 是 Python 3.9+ 原生泛型写法；
+        # `Optional[Cache]` 等价于 `Cache | None`。
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -220,18 +283,29 @@ class Qwen3ASRTextAttention(nn.Module):
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # 中文学习备注：这里完成的是
+        # hidden -> Q/K/V -> 加 RoPE -> 走 attention backend -> 再映射回 hidden。
+        # 细一点写就是：
+        # (B, S, H_model)
+        # -> 线性投影到 (B, S, H_heads * D_head)
+        # -> view 成 (B, S, H_heads, D_head)
+        # -> transpose 成 (B, H_heads, S, D_head)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            # 中文学习备注：生成阶段不会每一步都重新算全部历史 K/V；
+            # 这里把本步的 K/V 追加进缓存，后面 attention 就可以直接复用。
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # 语法点：
+        # 这里把函数当对象来传递/调用。`attention_interface(...)` 可能指向 eager、SDPA 或 FlashAttention。
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -251,6 +325,8 @@ class Qwen3ASRTextAttention(nn.Module):
 
 
 class Qwen3ASRTextMLP(nn.Module):
+    # 中文学习备注：标准的 gated MLP。
+    # 可以把它看成 decoder block 里的“前馈子层”。
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -262,11 +338,19 @@ class Qwen3ASRTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # 形状说明：
+        # x:         (B, S, H)
+        # gate/up:   (B, S, I)
+        # act(gate) * up: (B, S, I)
+        # down_proj: (B, S, H)
+        # 数学上是 gated MLP：Down(Act(Gate(x)) * Up(x))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
 class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
+    # 中文学习备注：一个标准 decoder layer = RMSNorm + Self-Attn + 残差 + RMSNorm + MLP + 残差。
+    # `GradientCheckpointingLayer` 的含义是：训练时可以按层重算前向，换显存省用量。
     def __init__(self, config: Qwen3ASRConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -305,6 +389,8 @@ class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         # Fully Connected
+        # 中文学习备注：残差连接保证 attention 子层和 MLP 子层都只做“增量修正”。
+        # 这也是深层 Transformer 能稳定训练的核心结构之一。
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -314,6 +400,10 @@ class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Qwen3ASRPreTrainedModel(PreTrainedModel):
+    # 中文学习备注：所有 HF 版模块的共同父类。
+    # 主要作用是把 config、attention backend 支持、gradient checkpointing 等通用能力收口。
+    # 语法点：类属性如 `_supports_flash_attn = True` 会被 HF 框架读取，
+    # 不是普通业务字段。
     config: Qwen3ASRConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -337,12 +427,21 @@ class Qwen3ASRThinkerCausalLMOutputWithPast(MoeCausalLMOutputWithPast):
     """
 
     rope_deltas: Optional[torch.LongTensor] = None
+    # 中文学习备注：`@dataclass` 会自动生成初始化器和字段管理逻辑，
+    # 这里相当于是在 HF 的标准输出对象上再额外挂一个 `rope_deltas` 字段。
 
 
 def _get_feat_extract_output_lengths(input_lengths):
     """
     Computes the output length of the convolutional layers and the output length of the audio encoder
     """
+    # 中文学习备注：
+    # `input_lengths` 是 mel 特征长度，不是原始采样点数。
+    # 这个公式等价于 3 层 stride=2 卷积之后还剩多少个时间步，
+    # 也就决定了一段音频最终会占多少个 audio placeholder 位置。
+    # 你可以近似把它记成：
+    # 长度经过 3 次 `L -> floor((L - 1) / 2) + 1`
+    # 但这里特意拆成 `% 100` 和 `// 100` 两部分，是为了和前处理/切窗的长度约定严格对齐。
 
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -384,6 +483,13 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
             batch_size (`torch.Tensor`):
                 Batch size.
         """
+        # 中文学习备注：当后端需要显式 4D causal mask 时，这个函数负责构造它。
+        # 如果用的是 FlashAttention/SDPA，一部分逻辑会被更底层的 kernel 接管。
+        # 形状流：
+        # 2D attention_mask: (B, K)
+        # -> 先构造 (Q, K_target) 的上三角 causal mask
+        # -> 再扩成 (B, 1, Q, K_target)
+        # -> 再把 padding 区域也置成最小值
         if attention_mask is not None and attention_mask.dim() == 4:
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
@@ -430,6 +536,8 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
             `list[tuple[int, int]]`: A list of tuples, each representing the start (inclusive)
                                 and end (exclusive) indices of a chunk in `token_indices`.
         """
+        # 中文学习备注：这个函数把一串单调递增的位置索引按固定大小切块。
+        # 它更像一个通用工具，不是音频塔数学本身。
 
         def _iter():
             i, start_idx = 0, 0  # skip bos token
@@ -437,6 +545,8 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
             while i < len(token_indices):  # skip eos token
                 if token_indices[i] - remove_index >= current_chunk * tokens_per_chunk:
                     yield (start_idx, i)
+                    # 中文学习备注：`yield` 说明这是一个 generator。
+                    # `list(_iter())` 会把它一次性消费成列表。
                     start_idx = i
                     current_chunk += 1
                 i += 1
@@ -471,6 +581,13 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
             mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
         """
         mrope_position_deltas = []
+        # 中文学习备注：Qwen3-ASR 的位置编码逻辑不是“单纯从 0 到 N-1”。
+        # 这里会结合 attention_mask 计算真正有效 token 的位置，并为多模态 RoPE 预留偏移量。
+        # 形状说明：
+        # attention_mask:        (B, S)
+        # cumsum 后 position:   (B, S)
+        # expand 后 position:   (3, B, S)
+        # mrope_position_delta:  (B, 1)
 
         position_ids = attention_mask.float().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
@@ -483,9 +600,13 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
 
 class Qwen3ASRAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    # 中文学习备注：这是音频 encoder 侧 attention。
+    # 和文本侧不同，它不是 causal 的，而是块内双向注意力。
 
     def __init__(self, config):
         super().__init__()
+        # 音频 encoder 这里 `num_key_value_groups = 1`，
+        # 因为它本质上是普通多头注意力，不需要文本侧那种 GQA 复用 K/V。
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
         self.dropout = config.attention_dropout
@@ -515,8 +636,14 @@ class Qwen3ASRAudioAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
+        # 中文学习备注：
+        # 这里的 `hidden_states` 已经不是传统 `(batch, seq, hidden)`，
+        # 而是把所有有效 chunk 打包后的 `(total_valid_frames, hidden)`。
+        # `cu_seqlens` 负责告诉注意力：每个 chunk 在这条长序列里的边界在哪里。
 
         seq_length, _ = hidden_states.size()
+        # 这里的 `-1` 最终会被推断成 `head_dim`。
+        # 因为 embed_dim = num_heads * head_dim。
 
         query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
         key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -525,6 +652,10 @@ class Qwen3ASRAudioAttention(nn.Module):
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
+        # 形状变化：
+        # (S_total, H, D) -> (H, S_total, D) -> (1, H, S_total, D)
+        # 前面的 `1` 是伪 batch 维，因为真正的 ragged 批边界靠 cu_seqlens 表示。
+        # FlashAttention 的 varlen 路径除了要知道 ragged 边界，还要知道最大的局部段长。
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
 
         attention_interface: Callable = eager_attention_forward
@@ -554,6 +685,8 @@ class Qwen3ASRAudioAttention(nn.Module):
 
 
 class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
+    # 中文学习备注：音频塔里的一个 encoder block。
+    # 结构上更像标准 Transformer encoder layer，而不是 decoder layer。
     def __init__(self, config: Qwen3ASRAudioEncoderConfig):
         super().__init__()
         self.embed_dim = config.d_model
@@ -586,6 +719,7 @@ class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
+        # 形状始终保持：(S_total, D_model)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
@@ -610,10 +744,13 @@ class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
 
 
 class SinusoidsPositionEmbedding(nn.Module):
+    # 中文学习备注：音频塔这里用的是经典正余弦位置编码，不是文本侧那套 RoPE 实现。
     def __init__(self, length, channels, max_timescale=10000):
         super().__init__()
         if channels % 2 != 0:
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
+        # 中文学习备注：`register_buffer` 注册的是“随模型一起搬设备/存 checkpoint，
+        # 但不参与训练”的张量，适合位置编码、均值方差统计这类常量。
         log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
         inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
         scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
@@ -624,6 +761,7 @@ class SinusoidsPositionEmbedding(nn.Module):
         )
 
     def forward(self, seqlen: int):
+        # 返回形状：(seqlen, channels)
         return self.positional_embedding[:seqlen, :]
 
 
@@ -648,6 +786,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         self.max_source_positions = config.max_source_positions
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
         self.n_window = config.n_window
+        # 中文学习备注：
+        # 这就是音频塔的主骨架：
+        # 3 层 Conv2d 先做时间下采样，再用 Transformer 编码，最后投影成可注入文本模型的 audio features。
         self.positional_embedding = SinusoidsPositionEmbedding(self.max_source_positions, embed_dim)
         self.layers = nn.ModuleList([Qwen3ASRAudioEncoderLayer(config) for _ in range(config.encoder_layers)])
         self.ln_post = nn.LayerNorm(config.d_model)
@@ -660,6 +801,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             config.d_model,
             bias=False,
         )
+        # 中文学习备注：
+        # 这里这个长公式本质上是在算“频率维经过 3 次 stride=2 后还剩多少格”，
+        # 然后乘上通道数 downsample_hidden_size，得到每个时间步 flatten 后的向量长度。
         self.proj1 = nn.Linear(config.d_model, config.d_model)
         self.act = ACT2FN[config.activation_function]
         self.proj2 = nn.Linear(config.d_model, config.output_dim)
@@ -669,6 +813,7 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         self.post_init()
 
     def _freeze_parameters(self):
+        # 中文学习备注：把整座音频塔冻结，常用于只想训文本侧或上层适配器时。
         for param in self.parameters():
             param.requires_grad = False
         self._requires_grad = False
@@ -684,10 +829,12 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         # NOTE: the created attention masl only approximates the ragged FA2 attention by
         # allowing bidirectional attention within `cu_seqlens` blocks, and not attending between
         # blocks. Though it will not be a 100% match for FA2's `varlen` path
+        # 中文学习备注：非 FA2 后端没有原生 ragged attention，只能用块对角 mask 去近似它。
         if self.config._attn_implementation == "flash_attention_2":
             return None
 
         seq_length = inputs_tensor.shape[0]
+        # 最终 mask 形状：(1, 1, S_total, S_total)
         attention_mask = torch.full(
             [1, 1, seq_length, seq_length],
             torch.finfo(inputs_tensor.dtype).min,
@@ -711,15 +858,27 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length after cnn
         """
+        # 中文学习备注：
+        # 同一个模型既能吃短音频也能吃长音频，关键不在“换一套网络”，
+        # 而在这里先把 mel 特征按固定窗口切块，再把卷积后的有效帧 packed 到一条长序列里。
+        # 输入/输出主形状：
+        # input_features:  (mel_bins, T_mel) 对单条样本来说是二维
+        # chunk_list:      若干个 (chunk_T, mel_bins) 小块
+        # padded_feature:  (N_chunk, mel_bins, max_chunk_T)
+        # conv 输出:       (N_chunk, C, F', T')
+        # packed hidden:   (S_total_after_cnn, D_model)
+        # return.last_hidden_state: (S_total_after_cnn, output_dim)
         # The encoder processes long audio as several fixed-size windows. This
         # keeps convolution and attention memory bounded while still letting us
         # concatenate the resulting hidden states into one long sequence.
         aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+        # 每条音频会被拆成多少个基础 chunk。
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
         # ``chunk_lengths`` describes how the long mel sequence is partitioned
         # into convolution-friendly windows. Every original sample may contribute
         # several windows plus one shorter tail.
+        # 中文学习备注：除尾块外，绝大多数 chunk 的 mel 长度都是固定的 `n_window * 2`。
         chunk_lengths = torch.tensor(
             [self.n_window * 2] * chunk_num.sum(),
             dtype=torch.long,
@@ -732,13 +891,20 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         # ``input_features`` arrives as (mel_bins, time). Splitting along the
         # transposed time axis yields a Python list of variable-length windows.
         chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        # 语法点：
+        # `input_features.T` 是转置，把时间维放到前面，便于按时间切块；
+        # `.split(chunk_lengths.tolist(), dim=0)` 会按“每块长度列表”切分，而不是固定等长切分。
         padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
+        # 中文学习备注：这个 mask 用来从 padding 后的 batch 中挑出卷积后的真实时间步，
+        # 后面会把它们重新打包成 packed hidden states。
         padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
             [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
             batch_first=True,
         )
         padded_feature = padded_feature.unsqueeze(1)
+        # 形状此时变成 (N_chunk, 1, mel_bins, max_chunk_T)，
+        # 可以直接喂给 Conv2d，其中 1 是输入通道数。
         # Convolution is the main activation-memory hotspot for long speech.
         # Running it chunk-by-chunk avoids OOM without changing the resulting
         # sequence because windows were already split above.
@@ -752,6 +918,11 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         b, c, f, t = padded_embed.size()
         # After the 2D conv stack we treat each time step's (channel, freq)
         # patch as one vector and project it into the Transformer width.
+        # 形状变化：
+        # (B_chunk, C, F', T')
+        # -> permute 成 (B_chunk, T', C, F')
+        # -> view 成 (B_chunk, T', C*F')
+        # -> Linear 到 (B_chunk, T', D_model)
         padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
 
         positional_embedding = (
@@ -763,13 +934,21 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         # ``padded_embed`` is batch-major, but varlen attention prefers a packed
         # representation plus cumulative sequence lengths.
         hidden_states = padded_embed[padded_mask_after_cnn]
+        # 中文学习备注：
+        # 这一步相当于把“padding 后的 chunk batch”重新压成一条 packed 序列。
+        # 也就是从 (N_chunk, T', D_model) -> (所有有效时间步拼接后的总长, D_model)
         cu_chunk_lens = [0]
+        # 中文学习备注：
+        # `window_aftercnn` 表示一个推理 attention 窗口在卷积后对应多少个 token。
+        # 默认配置下，`n_window_infer` 会把若干基础 chunk 组合成更大的局部注意力窗口。
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
         for cnn_len in aftercnn_lens:
             cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
             remainder = cnn_len % window_aftercnn
             if remainder != 0:
                 cu_chunk_lens += [remainder]
+        # 中文学习备注：`cu_seqlens = [0, len1, len1+len2, ...]`，
+        # 它是 ragged / varlen attention 的核心索引表。
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
         # ``cu_seqlens`` tells varlen attention where each ragged sequence starts
@@ -781,11 +960,14 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             )
 
             hidden_states = layer_outputs[0]
+        # 中文学习备注：每层都在同一条 packed 序列上做块内双向注意力。
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
+        # 中文学习备注：这里输出的是连续 audio features，不是离散 token id。
+        # 后面的 thinker 会把它们直接塞进 prompt 的音频占位符位置。
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     def padded_and_mask_function(self, tensor_list, tensor_len, padding_value=0, padding_side="right"):
@@ -793,6 +975,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         Pads a sequence of tensors to their maximum length on indicated `padding_side`.
         Then prepares a mask so that pad tokens are not attended to.
         """
+        # 中文学习备注：
+        # 这是一个通用 padding 工具：
+        # 输入若干个长度不一的 2D tensor，输出统一长度的 batch tensor 和对应 mask。
         max_len = tensor_len.max()
         dim = tensor_list[0].shape[0]
         padded_tensor = torch.full(
@@ -820,6 +1005,10 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         )
         for i, length in enumerate(feature_lens_after_cnn):
             batch_mask_after_cnn[i, :length] = 1
+        # 返回三件东西：
+        # 1. padded_tensor:         (B, dim, max_len)
+        # 2. batch_mask:           (B, 1, max_len)
+        # 3. batch_mask_after_cnn: (B, max_len_after_cnn)
         return (
             padded_tensor,
             batch_mask.unsqueeze(1),
@@ -829,9 +1018,13 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
 
 class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
+    # 中文学习备注：
+    # 这是 thinker 文本侧的 RoPE 生成器。
+    # 和普通 LLM 不同，这里还要适配多模态位置，所以会看到 3 维 position ids 和 mRoPE 逻辑。
 
     def __init__(self, config: Qwen3ASRConfig, device=None):
         super().__init__()
+        # `rope_type` 允许同一套代码支持多种 RoPE 变体。
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
             self.rope_type = config.rope_scaling.get("rope_type", "default")
         else:
@@ -844,6 +1037,8 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # 中文学习备注：`persistent=False` 表示它不会被保存到 state_dict，
+        # 因为它可以由 config 重新计算出来。
         self.original_inv_freq = self.inv_freq
 
         self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
@@ -858,6 +1053,8 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
         returns:
             x_t: (bs, seq_len, head_dim // 2)
         """
+        # 中文学习备注：这里在做多路位置频率的交织重排，
+        # 目的是把多模态位置布局对齐到 thinker 期望的格式。
         freqs_t = freqs[0]  # just overwrite the first dimension T
         for dim, offset in enumerate((1, 2), start=1):  # H, W
             length = mrope_section[dim] * 3
@@ -870,6 +1067,12 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         # In contrast to other models, Qwen3ASRThinker has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
+        # 中文学习备注：最终返回的是给 attention 用的 cos/sin，不是直接返回 position_ids。
+        # 输入形状：
+        # x:            (B, S, H_model) 或与之兼容的隐藏状态
+        # position_ids: (3, B, S) 或 (B, S)
+        # 输出：
+        # cos/sin:      (B, S, head_dim) 广播后可作用于 Q/K
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
@@ -877,6 +1080,8 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            # 语法点：`with torch.autocast(..., enabled=False)` 是上下文管理器，
+            # 明确关闭混合精度，避免 RoPE 三角函数在低精度下累积误差。
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
             freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
             emb = torch.cat((freqs, freqs), dim=-1)
@@ -887,6 +1092,8 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
 
 
 class Qwen3ASRThinkerTextMLP(nn.Module):
+    # 中文学习备注：Thinker 文本模型自己的 MLP 实现。
+    # 作用和前面的 `Qwen3ASRTextMLP` 类似，都是 decoder block 的前馈部分。
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
@@ -898,12 +1105,14 @@ class Qwen3ASRThinkerTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # 和前面的 TextMLP 一样，都是 (B, S, H) -> (B, S, H)。
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3ASRThinkerTextRMSNorm(nn.Module):
+    # 中文学习备注：Thinker 文本侧 RMSNorm。
     def __init__(self, hidden_size, eps=1e-6):
         """
         Qwen3ASRThinkerTextRMSNorm is equivalent to T5LayerNorm
@@ -913,6 +1122,7 @@ class Qwen3ASRThinkerTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        # 形状保持不变：(..., hidden_size) -> (..., hidden_size)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -925,6 +1135,9 @@ class Qwen3ASRThinkerTextRMSNorm(nn.Module):
 
 class Qwen3ASRThinkerTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    # 中文学习备注：
+    # 这是 Thinker 真正用到的文本 attention 实现。
+    # 它支持缓存 past_key_values，用于自回归生成。
 
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -955,6 +1168,7 @@ class Qwen3ASRThinkerTextAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
         self.sliding_window = None
+        # 中文学习备注：`sliding_window = None` 表示这里默认不开局部滑窗文本注意力。
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -968,6 +1182,10 @@ class Qwen3ASRThinkerTextAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        # 中文学习备注：这里的张量流和普通 LLM attention 基本一致，
+        # 只是位置编码来自前面专门算出的多模态 RoPE。
+        # 输入 hidden_states: (B, S, H_model)
+        # Q/K/V after transpose: (B, H_head, S, D_head)
 
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -1008,6 +1226,8 @@ class Qwen3ASRThinkerTextAttention(nn.Module):
     )
 )
 class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
+    # 中文学习备注：这是“只看文本序列”的 decoder 主体。
+    # 但这里的“文本序列”已经不一定是纯文本，因为前面可能已经把 audio embeddings 注进来了。
     config: Qwen3ASRConfig
     _no_split_modules = ["Qwen3ASRThinkerTextDecoderLayer"]
     config_class = Qwen3ASRConfig
@@ -1028,6 +1248,8 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         self.norm = Qwen3ASRTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3ASRThinkerTextRotaryEmbedding(config)
         self.gradient_checkpointing = False
+        # 中文学习备注：这里自己不关心音频。
+        # 它只接受一段已经组装好的 embedding 序列并当作普通 decoder 输入来处理。
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1045,15 +1267,21 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
+        # `@check_model_inputs()` 是 HF 的输入校验 decorator；
+        # 它会在 forward 前帮你检查 mutually exclusive 的输入组合等问题。
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache(config=self.config)
+        # 中文学习备注：DynamicCache 是 HF 的 KV cache 容器。
+        # 如果正在 tracing，则避免把这类复杂对象放进图里。
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        # 中文学习备注：如果调用方已经提前把 audio embeddings 合进来了，
+        # 这里就会直接走 `inputs_embeds` 分支，而不再重新查纯文本 embedding。
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1062,6 +1290,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
             )
 
         # the hard coded `3` is for temporal, height and width.
+        # 中文学习备注：这里的 3 维 position_ids 是多模态 RoPE 约定的一部分。
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
@@ -1072,9 +1301,12 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
             position_ids = position_ids[1:]
         else:
             text_position_ids = position_ids[0]
+        # 中文学习备注：这里兼容两种位置格式：
+        # 一种只给 3 路多模态位置，一种额外还带一份文本位置索引。
 
         # The thinker is still a causal decoder, but it uses the multimodal RoPE
         # indexing scheme produced above.
+        # 中文学习备注：虽然有音频参与，但 decoder 依然是严格的 causal decoder。
         attention_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -1087,6 +1319,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
+        # 中文学习备注：先统一算一份 cos/sin，再在每层 attention 里复用。
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -1116,6 +1349,12 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
     """
 )
 class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditionalGeneration, GenerationMixin):
+    # 中文学习备注：
+    # 这是 ASR 主体里最重要的类之一。
+    # 它做三件事：
+    # 1. 调 audio_tower 把音频转成连续向量
+    # 2. 把这些向量替换进 prompt 的音频占位符
+    # 3. 调文本 decoder 自回归生成识别结果
     config: Qwen3ASRThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
@@ -1130,6 +1369,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
     def __init__(self, config):
         super().__init__(config)
+        # 中文学习备注：audio_tower 负责“听”，model/lm_head 负责“写”。
         self.audio_tower = Qwen3ASRAudioEncoder._from_config(config.audio_config)
         self.vocab_size = config.text_config.vocab_size
         self.model = Qwen3ASRThinkerTextModel._from_config(config.text_config)
@@ -1142,9 +1382,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         self.post_init()
 
     def get_input_embeddings(self):
+        # 代理方法：直接复用内部文本模型的 embedding 表。
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
+        # 代理方法：允许外部替换 embedding 表，例如做词表扩展或权重共享实验。
         self.model.set_input_embeddings(value)
 
     def get_audio_features(
@@ -1169,14 +1411,21 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         else:
             audio_feature_lengths = None
         feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        # 中文学习备注：
+        # 这里有一个接口层兼容写法：既支持显式给长度，也支持从 mask 里现算长度。
     
         # The audio tower is applied sample-by-sample. This is slower than a
         # padded batch, but it avoids subtle precision and masking mismatches for
         # very uneven audio lengths.
+        # 中文学习备注：这里按样本逐条跑 audio_tower，
+        # 目的是保证裁剪后的真实长度与 placeholder 数严格对齐。
         audio_features = []
         for input_feature, feature_len in zip(input_features, feature_lens):
             # Slice away feature padding before entering the audio encoder so the
             # packed output length matches the placeholder count exactly.
+            # 单条样本形状：
+            # input_feature[:, :feature_len] -> (mel_bins, real_T)
+            # audio_output.last_hidden_state -> (audio_token_len, output_dim)
             audio_output = self.audio_tower(
                 input_feature[:, :feature_len],
                 feature_lens=feature_len.unsqueeze(0),
@@ -1205,10 +1454,13 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             ).all(-1)
         else:
             special_audio_mask = input_ids == self.config.audio_token_id
+        # 中文学习备注：如果没有 input_ids，只能退化成“比 embedding 向量本身”来找占位符，
+        # 这也是为什么这里用了 `.all(-1)`。
 
         # ``masked_scatter`` expects a boolean mask with the same final shape as
         # the target tensor, so we expand the token-level mask across hidden
         # dimensions.
+        # 中文学习备注：这张 mask 回答的是“哪些文本位置其实应该被音频向量替换”。
         special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         return special_audio_mask
 
@@ -1248,6 +1500,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         if inputs_embeds is None:
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
+            # 中文学习备注：此时还是“纯文本占位符 embedding”视角。
 
         # 2. Merge text, audios
         if input_features is not None:
@@ -1259,6 +1512,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
             # Replace placeholder token embeddings with encoded speech features.
+            # 中文学习备注：这是整套架构最关键的一步桥接：
+            # prompt 里先有一串音频占位符，然后用连续 audio features 覆盖这些位置的 embedding。
+            # 形状匹配要求：
+            # audio_mask 展开后为 (B, S, H_model)
+            # audio_features 需要能按这个 mask 展平后的元素数刚好填满对应位置
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
         if feature_attention_mask is not None:
@@ -1274,6 +1532,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             ):
                 # ``delta0`` compensates for left padding so multimodal RoPE
                 # indices line up with the true, unpadded token positions.
+                # 中文学习备注：第一次解码时要完整计算多模态位置偏移；
+                # 后续增量生成时则复用缓存的 rope_deltas。
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
                 position_ids, rope_deltas = self.get_rope_index(
                     attention_mask,
@@ -1301,10 +1561,14 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         )
 
         hidden_states = outputs[0]
+        # 中文学习备注：到这里为止，audio 信息已经完全混进 hidden_states 里了，
+        # 后面的 lm_head 并不区分“这是文本来的”还是“这是音频注入来的”上下文。
         logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
+            # 中文学习备注：训练时这里走标准 next-token loss；
+            # 推理时 labels=None，loss 分支不会执行。
             loss = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
             )
@@ -1331,6 +1595,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         feature_attention_mask=None,
         **kwargs,
     ):
+        # 中文学习备注：生成阶段的关键优化在这里：
+        # 第一步需要音频特征；后续 token 续写只靠文本侧 KV cache，不必重复编码整段音频。
+        # 这也是“重用同一份音频上下文”的关键，否则 streaming/offline 每步都会重复跑 audio_tower。
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1358,6 +1625,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
 @auto_docstring
 class Qwen3ASRThinkerTextPreTrainedModel(PreTrainedModel):
+    # 中文学习备注：这个类更像“只暴露文本模型能力”的预训练父类壳。
     config = Qwen3ASRConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -1376,16 +1644,20 @@ class Qwen3ASRThinkerTextPreTrainedModel(PreTrainedModel):
 
 
 class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin):
+    # 中文学习备注：最外层 API wrapper。
+    # 用户通常拿到的是这个类；它内部再把工作转交给 thinker。
     config_class = Qwen3ASRConfig
 
     def __init__(self, config: Qwen3ASRConfig):
         super().__init__(config)
         self.config = config
 
+        # 中文学习备注：真正的识别逻辑几乎都在 thinker 里。
         self.thinker = Qwen3ASRThinkerForConditionalGeneration._from_config(config.thinker_config)
         self.post_init()
     
     def get_support_languages(self):
+        # 简单透传配置里的语言列表。
         return self.config.support_languages
 
     @torch.no_grad()
@@ -1401,6 +1673,9 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
             "max_new_tokens": max_new_tokens,
             "eos_token_id": eos_token_id,
         }
+        # 中文学习备注：顶层 wrapper 自己不重新实现生成，
+        # 它只是把参数整理后转发给真正的 thinker 子模块。
+        # 语法点：这里通过拆 kwargs 的方式把“顶层通用参数”和“thinker 需要的参数”重新归类。
 
         # Route kwargs to the thinker submodule while preserving the familiar
         # ``model.generate(...)`` surface on the wrapper class.

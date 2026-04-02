@@ -125,9 +125,19 @@ except:
 
 logger = init_logger(__name__)
 
+# 中文学习备注：这份文件建议按下面顺序阅读。
+# 1. `_get_feat_extract_output_lengths`：长度公式要和 HF 版完全一致
+# 2. `Qwen3ASRAudioEncoder`：看 vLLM 版音频塔如何复刻
+# 3. `Qwen3ASRMultiModalProcessor`：看 prompt 占位符如何扩写
+# 4. `Qwen3ASRForConditionalGeneration.embed_multimodal/embed_input_ids`
+#    ：看音频 embedding 如何并进文本序列
+
 
 def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
     """Mirror the Hugging Face processor's audio downsampling length formula."""
+    # 中文学习备注：
+    # vLLM 路径必须和 Transformers 路径共用同一套长度公式，
+    # 否则 prompt 里展开的音频占位符数量会和 audio_tower 实际产出的 feature 数对不上。
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     output_lengths = (
@@ -141,6 +151,7 @@ def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
 
 class SinusoidsPositionEmbedding(nn.Module):
     """Sinusoidal position embedding for audio encoder."""
+    # 中文学习备注：vLLM 版音频塔沿用同样的正余弦位置编码。
 
     def __init__(self, length: int, channels: int, max_timescale: int = 10000):
         super().__init__()
@@ -171,6 +182,8 @@ class SinusoidsPositionEmbedding(nn.Module):
 
 class Qwen3ASRAudioAttention(nn.Module):
     """Multi-headed attention for Qwen3-Omni Audio Encoder using MMEncoderAttention."""
+    # 中文学习备注：这里和 HF 版的差异主要在“执行器”：
+    # HF 版用 ALL_ATTENTION_FUNCTIONS 分发，vLLM 版直接走 MMEncoderAttention。
 
     def __init__(
         self,
@@ -228,6 +241,8 @@ class Qwen3ASRAudioAttention(nn.Module):
         # vLLM's attention kernels expect (batch, seq, heads, head_dim). We use
         # a synthetic batch dimension of 1 because the sequences are already
         # packed with ``cu_seqlens``.
+        # 中文学习备注：这里和 Transformers 版的本质完全一样，
+        # 只是 attention 内核换成了 vLLM 的 MMEncoderAttention。
         q = q.view(1, seq_length, -1, self.head_dim)
         k = k.view(1, seq_length, -1, self.head_dim)
         v = v.view(1, seq_length, -1, self.head_dim)
@@ -247,6 +262,7 @@ class Qwen3ASRAudioAttention(nn.Module):
 
 class Qwen3ASRAudioEncoderLayer(nn.Module):
     """Transformer encoder layer for Qwen3-Omni Audio Encoder."""
+    # 中文学习备注：一层音频 encoder block，结构仍然是 Attn + MLP + 残差。
 
     def __init__(
         self,
@@ -330,6 +346,9 @@ class Qwen3ASRAudioEncoder(nn.Module):
         self.n_window = config.n_window
         self.n_window_infer = config.n_window_infer
         self.conv_chunksize = config.conv_chunksize
+        # 中文学习备注：
+        # 这一版是“vLLM 运行时重写版音频塔”，不是另一套新架构。
+        # 如果你已经读过 Transformers 版，这里主要对照看：卷积、packed 序列、cu_seqlens、输出投影。
 
         # Position embedding
         self.positional_embedding = SinusoidsPositionEmbedding(
@@ -390,6 +409,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
     def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:
         """Compute max_seqlen only for flash attention backends."""
+        # 中文学习备注：某些 FA backend 需要显式给出当前 batch 里最大的局部段长。
         max_seqlen = None
         if self.attn_backend in {
             AttentionBackendEnum.FLASH_ATTN,
@@ -412,6 +432,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
+        # 中文学习备注：这里复现的就是“长音频先切 chunk，再打包做局部 attention”的主流程。
         # Compute chunk information
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -488,6 +509,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
             cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
             if remainder:
                 cu_chunk_lens.append(remainder)
+        # 中文学习备注：`cu_seqlens` 和 Transformers 版同义，
+        # 都是在 packed hidden states 上标记 ragged chunk 的边界。
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
@@ -519,6 +542,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with mapping from HuggingFace format."""
+        # 中文学习备注：因为 vLLM 版把 q/k/v 合成了一个 qkv 参数，
+        # 所以加载 HF 权重时需要做一次名字映射和分片装配。
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("self_attn.qkv.", "self_attn.q_proj.", "q"),
@@ -551,6 +576,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
 class Qwen3ASRProcessingInfo(BaseProcessingInfo):
     """Bridge vLLM's multimodal registry with the Hugging Face processor objects."""
+    # 中文学习备注：这是 vLLM 多模态注册体系里的“信息提供者”。
+    # 它告诉 vLLM：这个模型对应哪个 HF config、哪个 processor、支持什么模态。
 
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3ASRConfig).thinker_config
@@ -577,6 +604,8 @@ class Qwen3ASRProcessingInfo(BaseProcessingInfo):
 
 class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo]):
     """Generate synthetic multimodal requests for profiling and shape inference."""
+    # 中文学习备注：profiling / shape 推断时，vLLM 会先造假输入。
+    # 这里决定“假的音频长什么样”。
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_audios = mm_counts.get("audio", 0)
@@ -617,6 +646,8 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
 
 def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
     """Describe how batched audio tensors are laid out inside vLLM multimodal inputs."""
+    # 中文学习备注：这一步是在告诉 vLLM：
+    # batched audio 特征、长度、mask 在内存里怎么排布。
     audio_feature_lengths = hf_inputs.get("audio_feature_lengths", torch.empty((0,)))
     return dict(
         input_audio_features=MultiModalFieldConfig.flat_from_sizes(
@@ -629,6 +660,7 @@ def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
 
 class Qwen3ASRMultiModalDataParser(MultiModalDataParser):
     """Accept either raw audio items or precomputed audio-feature dictionaries."""
+    # 中文学习备注：既支持原始音频，也支持已经提取好的 audio features 直接喂进来。
 
     def _parse_audio_data(
         self,
@@ -649,8 +681,12 @@ class Qwen3ASRMultiModalProcessor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
 ):
     """Customize prompt replacement and feature bookkeeping for audio-only ASR."""
+    # 中文学习备注：
+    # 这个类是 vLLM 路径里最值得学的胶水层。
+    # 因为“音频怎么从一个占位符变成 N 个 placeholder token”就是它决定的。
 
     def _get_data_parser(self) -> MultiModalDataParser:
+        # 中文学习备注：把输入音频解析器固定成 Qwen3-ASR 自己这套。
         feature_extractor = self.info.get_feature_extractor()
         return Qwen3ASRMultiModalDataParser(
             target_sr=feature_extractor.sampling_rate,
@@ -661,6 +697,7 @@ class Qwen3ASRMultiModalProcessor(
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
+        # 中文学习备注：把 HF processor 产出的字段布局翻译成 vLLM 能理解的 field config。
         return _qwen3asr_field_config(hf_inputs)
 
     def _get_prompt_updates(
@@ -669,6 +706,9 @@ class Qwen3ASRMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, Any],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        # 中文学习备注：
+        # vLLM 路径里，“一个音频占位符到底要扩成多少个序列位置”就是在这里显式决定的。
+        # 数量必须和 audio_tower 产出的 feature 数一模一样，否则后面 embedding 合并会报 shape 错。
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
         vocab = tokenizer.get_vocab()
@@ -703,6 +743,7 @@ class Qwen3ASRMultiModalProcessor(
 
             # The prompt token stream must reserve one placeholder token per
             # encoded audio feature vector so embedding replacement is shape-safe.
+            # 中文学习备注：这里返回的不是最终识别结果，而是“给音频 embedding 预留坑位”的 token 序列。
             return [audio_token_id] * num_features
 
         return [
@@ -727,6 +768,9 @@ class Qwen3ASRForConditionalGeneration(
     SupportsTranscription,
 ):
     supported_languages = ISO639_1_SUPPORTED_LANGS
+    # 中文学习备注：
+    # 这是 vLLM 世界里的顶层模型类。
+    # 你可以把它理解成“HF 版 ThinkerForConditionalGeneration 的 vLLM 适配壳”。
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -756,6 +800,8 @@ class Qwen3ASRForConditionalGeneration(
         self.config = thinker_config
         self.multimodal_config = multimodal_config
 
+        # 中文学习备注：这里不是另起一套模型，而是把“音频塔 + Qwen3 文本模型”
+        # 接进 vLLM 的多模态运行时。
         self.audio_tower = Qwen3ASRAudioEncoder(
             thinker_config.audio_config,
             multimodal_config=multimodal_config,
@@ -778,6 +824,7 @@ class Qwen3ASRForConditionalGeneration(
         self, **kwargs: object
     ) -> Qwen2_5OmniAudioFeatureInputs | None:
         """Normalize raw multimodal kwargs into vLLM's typed audio-input object."""
+        # 中文学习备注：先把松散 kwargs 规整成 vLLM 内部标准的 audio 输入对象。
         input_audio_features = kwargs.pop("input_audio_features", None)
         audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
@@ -792,6 +839,7 @@ class Qwen3ASRForConditionalGeneration(
         )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
+        # 中文学习备注：当前模型只关心 audio 模态，但仍然遵守 vLLM 的统一多模态入口格式。
         mm_input_by_modality = {}
 
         # Preserve the order of modalities if there are multiple of them
@@ -815,6 +863,8 @@ class Qwen3ASRForConditionalGeneration(
         input_features = audio_input["input_features"]
         audio_feature_lengths = audio_input["audio_feature_lengths"]
 
+        # 中文学习备注：先算每条音频最终会产出多少个 audio features，
+        # 再跑 audio_tower，最后按长度切回“每条音频一段 embedding 序列”。
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
         audio_features = self.audio_tower(
@@ -825,6 +875,7 @@ class Qwen3ASRForConditionalGeneration(
         return audio_features.split(audio_output_lengths.tolist())
 
     def get_language_model(self) -> torch.nn.Module:
+        # 中文学习备注：vLLM 上层有时只关心“文本模型部分”。
         return self.language_model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
@@ -834,6 +885,8 @@ class Qwen3ASRForConditionalGeneration(
         vLLM keeps text embedding and multimodal embedding as separate concepts
         until late in the pipeline, which allows more flexible batching.
         """
+        # 中文学习备注：vLLM 的思路是“先单独把音频编码成 embeddings，
+        # 再在更晚的阶段和文本 embedding 合并”。
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -871,6 +924,8 @@ class Qwen3ASRForConditionalGeneration(
 
         # Merge audio embeddings into the placeholder token positions computed by
         # vLLM's multimodal planner.
+        # 中文学习备注：这一步和 Transformers 版的 `masked_scatter` 是同一件事，
+        # 只是这里换成了 vLLM 统一的多模态合并接口。
         inputs_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
@@ -887,6 +942,8 @@ class Qwen3ASRForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # 中文学习备注：真正的前向大多已经在 embedding 合并阶段准备好了；
+        # 这里主要是把合成后的输入交给 Qwen3 文本模型。
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -903,9 +960,11 @@ class Qwen3ASRForConditionalGeneration(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # 中文学习备注：标准语言模型头，把 hidden_states 投到词表 logits。
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # 中文学习备注：复用 AutoWeightsLoader，把 HF checkpoint 权重映射进 vLLM 模块树。
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["talker.", "code2wav."],
@@ -949,6 +1008,8 @@ class Qwen3ASRForConditionalGeneration(
             audio_len = _get_feat_extract_output_lengths(
                 torch.tensor(audio_feature_length)
             ).item()
+            # 中文学习备注：虽然原始 prompt 里只是一个音频占位符片段，
+            # 但位置编码必须按“展开后的 audio_len 个位置”来编号。
 
             # Text segment before audio (includes audio_start token)
             text_len = offset - st
@@ -990,6 +1051,7 @@ class Qwen3ASRForConditionalGeneration(
         """
         Get the module prefix in multimodal models
         """
+        # 中文学习备注：告诉 vLLM 哪部分是 language model，哪部分是 multimodal tower。
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             tower_model=["audio_tower."],
@@ -999,6 +1061,7 @@ class Qwen3ASRForConditionalGeneration(
     def get_speech_to_text_config(
         cls, model_config: ModelConfig, task_type: str
     ) -> SpeechToTextConfig:
+        # 中文学习备注：从 processor 里把采样率、最大音频长度这些服务层配置提出来。
         processor = cached_processor_from_config(model_config)
         feature_extractor: WhisperFeatureExtractor = processor.feature_extractor
         return SpeechToTextConfig(
@@ -1020,6 +1083,10 @@ class Qwen3ASRForConditionalGeneration(
         """Get the generation prompt to be used for transcription requests."""
         tokenizer = cached_tokenizer_from_config(model_config)
         audio_placeholder = cls.get_placeholder_str("audio", 0)
+        # 中文学习备注：
+        # 服务侧 prompt 很薄，只负责搭起 user/audio/assistant 这层外壳；
+        # 真正把音频展开成多个 placeholder，并替换成 embeddings，
+        # 是前面的 multimodal processor 和 model 在做。
 
         if task_type not in ("transcribe", "translate"):
             raise ValueError(
