@@ -38,12 +38,311 @@
 - 音频是怎么变成语音 token 的？
 - 为什么同一个模型既能处理短 chunk，也能处理长音频？
 - 为什么论文里说它可以统一 streaming/offline？
+- 尽量能够手撕代码
 
 核心源码：
 
 - [qwen_asr/core/transformers_backend/modeling_qwen3_asr.py](./qwen_asr/core/transformers_backend/modeling_qwen3_asr.py)
 - [qwen_asr/core/vllm_backend/qwen3_asr.py](./qwen_asr/core/vllm_backend/qwen3_asr.py)
 - [qwen_asr/core/transformers_backend/configuration_qwen3_asr.py](./qwen_asr/core/transformers_backend/configuration_qwen3_asr.py)
+
+
+### 2.1.1 先建立总图 [A+B]
+
+```text
+configuration_qwen3_asr.py
+  -> 定义模型拓扑和关键超参
+  -> 重点看：audio_config / text_config / thinker_config / audio_token_id
+
+modeling_qwen3_asr.py
+  -> Transformers 版主实现
+  -> 重点看：Qwen3ASRAudioEncoder.forward()
+           Qwen3ASRThinkerForConditionalGeneration.get_audio_features()
+           get_placeholder_mask()
+           forward() 里的 masked_scatter
+
+qwen3_asr.py (vLLM backend)
+  -> vLLM 版实现 + 多模态接线层
+  -> 重点看：Qwen3ASRAudioEncoder.forward()
+           Qwen3ASRMultiModalProcessor._get_prompt_updates()
+           embed_multimodal()
+           embed_input_ids()
+```
+
+把它们串成一句话就是：
+
+> `configuration_qwen3_asr.py` 定义“模型长什么样”，`modeling_qwen3_asr.py` 定义“Transformers 下怎么真正算”，`qwen3_asr.py` 定义“vLLM 下怎么把同一套音频塔和文本解码器接进服务框架”。  
+
+### 2.1.2 先看 configuration_qwen3_asr.py：这不是样板文件，而是结构合同 [A]
+
+这个文件最容易被低估，因为它看起来像“默认参数收纳处”，但其实它定义了整个 Qwen3-ASR 的三层拓扑：
+
+1. `Qwen3ASRAudioEncoderConfig`
+2. `Qwen3ASRTextConfig`
+3. `Qwen3ASRThinkerConfig`
+4. `Qwen3ASRConfig`
+
+建议你读这个文件时，带着下面四个问题看：
+
+- 音频塔输入是什么维度？  
+  `num_mel_bins=128`，这直接对应论文里的 128 维 Fbank。
+- 音频塔中间怎么跑？  
+  `encoder_layers`、`encoder_attention_heads`、`encoder_ffn_dim`、`d_model` 定义了音频 encoder 的 Transformer 主体。
+- 长音频靠什么被切开处理？  
+  `n_window`、`n_window_infer`、`conv_chunksize` 这三个参数最关键，它们不是随便的工程参数，而是长音频分块、卷积分段、防 OOM、attention window 划分的直接控制柄。
+- 音频最后怎么接到文本模型里？  
+  `audio_token_id`、`audio_start_token_id` 定义了 prompt 里音频占位符与真正音频特征的桥梁。
+
+这里最值得记住的一点是：
+
+> Qwen3-ASR 不是“一个音频模型 + 一个文本模型松散拼一下”，而是通过 `Qwen3ASRThinkerConfig` 把 `audio_config` 和 `text_config` 绑定成一个真正的多模态生成模型。  
+
+也就是说，后面你在 `modeling_qwen3_asr.py` 里看到的“先算 audio tower，再把 audio feature 塞进文本 embedding 序列”，在配置层其实已经埋好了接口。
+
+### 2.1.3 再看 modeling_qwen3_asr.py：这是结构细节最密的主战场 [A+B]
+
+这份文件很长，但如果是为了学 2.1，你不要平均用力。建议先抓四个锚点。
+
+#### 锚点 1：`_get_feat_extract_output_lengths()` [A]
+
+这是整个“音频会变成多少个语音位置”的长度公式入口。
+
+它做的事情很朴素：
+
+- 输入：原始 mel 特征长度
+- 输出：经过 3 层 stride=2 的卷积后，剩下多少个时间步
+
+这件事非常关键，因为后面无论是 Transformers 还是 vLLM，都必须提前知道：
+
+- 一段音频最终会产生多少个 audio feature
+- prompt 里需要预留多少个 audio placeholder
+
+所以你可以把这个函数理解为：
+
+> “音频长度”到“音频占位长度”的官方换算器。  
+
+#### 锚点 2：`Qwen3ASRAudioEncoder` [A+B]
+
+这是“音频怎么变成语音 token”的真正答案所在。
+
+更准确地说，源码里产生的不是离散 token id，而是连续的 `audio_features / audio_embeddings`。论文或文档里口语化地叫它“audio token”，但从实现上看，它本质是会去替换文本占位 embedding 的连续向量。
+
+这部分要重点看 `__init__()` 和 `forward()`。
+
+`__init__()` 里先把主干结构搭出来：
+
+- `conv2d1`
+- `conv2d2`
+- `conv2d3`
+- `layers`
+- `proj1`
+- `proj2`
+
+你可以把这条链路记成：
+
+```text
+Fbank
+  -> 3层 Conv2d(stride=2)
+  -> 压缩后的时序表示
+  -> Audio Transformer Encoder
+  -> proj1 + 激活 + proj2
+  -> audio features
+```
+
+`forward()` 里真正体现了“同一个模型既能吃短 chunk，也能吃长音频”：
+
+1. 先按 `self.n_window * 2` 把 mel 特征切成多个 chunk  
+2. 每个 chunk 先过 3 层卷积，下采样 8 倍  
+3. 卷积输出被整理成 `(time, hidden)` 形式，再加位置编码  
+4. 用 `padded_mask_after_cnn` 把有效帧抽出来，形成 packed 的 `hidden_states`  
+5. 用 `cu_seqlens` 标记每个 ragged chunk 在 packed 序列中的边界  
+6. 每层 `Qwen3ASRAudioEncoderLayer` 都按这些边界做 attention  
+7. 最后过 `ln_post + proj1 + act + proj2`，得到可注入文本模型的音频特征
+
+这里有两个学习重点。
+
+第一个重点是：长音频并不是靠“整段做一次超大 dense attention”处理的。
+
+源码实际上做的是：
+
+- 卷积前先切块
+- 卷积后再把有效时间步打包
+- attention 时靠 `cu_seqlens` 指出每个局部块的边界
+
+所以它本质上是在做一种带块边界的 varlen/ragged attention。
+
+第二个重点是：
+
+> “统一 streaming/offline”在模型结构层上的含义，不是有两套不同网络，而是同一个 `Qwen3ASRAudioEncoder`，面对短输入时块少一点，面对长输入时块多一点，权重完全一样。  
+
+也就是说，流式和离线首先在这里共享的是同一套音频塔，而不是两套模型。
+
+#### 锚点 3：`get_audio_features()` [A]
+
+这个函数在 `Qwen3ASRThinkerForConditionalGeneration` 里，是音频塔和文本解码器之间的桥。
+
+它做的事情是：
+
+- 先根据 `feature_attention_mask` 算出每段音频真正的特征长度
+- 对 batch 里的每段音频逐条调用 `self.audio_tower(...)`
+- 把各段输出拼接成一个总的 `audio_features`
+
+这里源码专门选择了“逐条算音频塔”，注释里说得很明确，理由是避免长度很不齐时的 padding/masking 误差。
+
+这说明作者在这里优先保证的是：
+
+- 输出长度和 placeholder 数严格对齐
+- 多条长度差异很大的音频不会互相干扰
+
+#### 锚点 4：`get_placeholder_mask()` 和 `forward()` 里的 `masked_scatter` [A]
+
+这是“音频怎么接进文本模型”的关键一步。
+
+逻辑非常重要：
+
+1. 先把文本 prompt 变成 `inputs_embeds`
+2. prompt 里原本包含若干个 `audio_token_id`
+3. `get_placeholder_mask()` 找到这些音频占位位置
+4. `inputs_embeds.masked_scatter(audio_mask, audio_features)` 把这些位置上的文本占位 embedding，替换成真正的音频特征
+
+这一步之后，文本 decoder 看到的就不再是“一个抽象的 `<audio>` token”，而是一长串已经编码好的音频向量。
+
+这里再补一个很关键的阅读提醒：
+
+- 在 Transformers 路径里，这些 `audio_token_id` 通常是在进入 `modeling_qwen3_asr.py` 之前，由 processor 侧先准备好的
+- 在 vLLM 路径里，这个“把一个音频占位符扩成 N 个位置”的动作，则是直接写在 `qwen3_asr.py` 的 `_get_prompt_updates()` 里
+
+所以从实现视角看：
+
+> 音频不是先被离散化成某套 speech token id 再喂给 decoder，而是先被 audio tower 编成连续向量，然后直接覆盖 prompt 里的音频占位 embedding。  
+
+这是理解整个架构时最容易被说糊涂、但源码里其实最清楚的一点。
+
+### 2.1.4 最后看 qwen3_asr.py：它证明 vLLM 没有“换模型”，只是“换运行时” [A+B]
+
+这份文件如果你第一次看，很容易被大量 vLLM 接口名吓住。正确读法是先分层：
+
+1. 音频塔复刻
+2. 多模态处理器
+3. vLLM 顶层模型封装
+
+先看音频塔部分，你会发现它和 Transformers 版在结构上是严格同构的：
+
+- 同样的 `_get_feat_extract_output_lengths()`
+- 同样的 3 层 stride=2 卷积
+- 同样的 `n_window / n_window_infer / conv_chunksize`
+- 同样的 packed hidden states + `cu_seqlens`
+- 同样的输出投影 `proj1 + act + proj2`
+
+这说明一件事：
+
+> `qwen3_asr.py` 不是重新发明了一套 ASR 架构，而是在 vLLM 的张量并行、多模态注册、服务接口约束下，把同一套架构重写了一遍。  
+
+区别主要在运行时细节上：
+
+- attention 实现换成了 vLLM 的 `MMEncoderAttention`
+- 线性层换成了 `QKVParallelLinear / RowParallelLinear / ColumnParallelLinear`
+- 多了 processor / parser / registry 这一整层“怎么让 vLLM 知道音频该怎么进模型”的胶水代码
+
+其中最值得重点看的，是 `Qwen3ASRMultiModalProcessor._get_prompt_updates()`。
+
+这个函数几乎把“音频占位符扩成多少个位置”这件事摊开给你看了：
+
+1. 先根据输入音频长度，调用 `_get_feat_extract_output_lengths()` 算出 `audio_output_lengths`
+2. 再把 prompt 里的一个音频占位符，替换成 `num_features` 个 `audio_token_id`
+
+也就是说，vLLM 路径里这件事是显式写出来的：
+
+> 一段音频最终会占多少个序列位置，不是拍脑袋决定，而是由音频塔下采样公式提前算出来。  
+
+然后在顶层 `Qwen3ASRForConditionalGeneration` 里，流程变成：
+
+```text
+embed_multimodal()
+  -> _process_audio_input()
+  -> audio_tower()
+  -> 得到每段音频的 embeddings
+
+embed_input_ids()
+  -> 先做文本 embedding
+  -> 再用 _merge_multimodal_embeddings()
+  -> 把音频 embeddings 合并进 placeholder 位置
+```
+
+这和 Transformers 版的 `masked_scatter` 在本质上是一回事，只是接入点换成了 vLLM 的多模态 planner。
+
+### 2.1.5 三份文件合起来，正好回答你最关心的三个问题 [A+B+C]
+
+#### 问题 1：音频是怎么变成语音 token 的？
+
+更精确的源码表述应该是：
+
+```text
+音频波形
+  -> feature extractor 变成 128 维 Fbank
+  -> audio encoder 做 8 倍时间下采样
+  -> transformer encoder 输出连续 audio features
+  -> 这些 features 替换 prompt 里的 audio placeholder embeddings
+  -> 文本 decoder 在“混合序列”上继续自回归生成
+```
+
+所以如果你看到“语音 token”这个说法，最好在脑子里自动翻译成：
+
+> “占据文本序列位置的音频特征向量”，而不是“离散 speech token id”。  
+
+#### 问题 2：为什么同一个模型既能处理短 chunk，也能处理长音频？
+
+因为长度变化不是通过换模型解决的，而是通过同一音频塔里的分块与 packed attention 解决的。
+
+短音频时：
+
+- `chunk_num` 小
+- `cu_seqlens` 段数少
+- attention 只覆盖少量块
+
+长音频时：
+
+- `chunk_num` 大
+- `cu_seqlens` 段数多
+- 仍然是同一套卷积层、同一套 encoder 层、同一套投影层
+
+因此“短 chunk”和“长音频”的差别，更多是输入切分方式不同，而不是模型结构不同。
+
+#### 问题 3：为什么论文里说它可以统一 streaming/offline？
+
+从这三份文件能支持的最稳妥表述是：
+
+1. 音频塔结构本身就是按局部窗口和分块 attention 设计的  
+2. 同一套权重既能编码短前缀，也能编码长序列  
+3. vLLM 和 Transformers 后端都沿用了这套长度换算与占位替换逻辑  
+
+所以论文所说的“统一 streaming/offline”，在模型结构层上是成立的。
+
+但要注意一个非常重要的边界：
+
+> “模型结构支持统一”不等于“这个仓库暴露出的 streaming API 已经做成严格的增量状态式解码”。  
+
+前者是 2.1 这三份文件告诉你的事。  
+后者要去 2.2 的推理包装层和 2.3 的 demo 层看。
+
+### 2.1.6 建议你的阅读顺序 [实战版]
+
+如果你现在就要开始读代码，我建议按这个顺序：
+
+1. 先读 `configuration_qwen3_asr.py`  
+   只做一件事：把 `audio_config / text_config / thinker_config / audio_token_id` 这几个名词记牢。
+2. 再读 `modeling_qwen3_asr.py`  
+   只盯住四个锚点：`_get_feat_extract_output_lengths()`、`Qwen3ASRAudioEncoder.forward()`、`get_audio_features()`、`masked_scatter`。
+3. 最后读 `qwen3_asr.py`  
+   重点确认三件事：音频塔是否同构、placeholder 是怎么扩写的、audio embeddings 是怎么并进 vLLM 的。
+
+如果你按这个顺序读，你会明显感觉到：
+
+- 第一个文件是在“定义世界”
+- 第二个文件是在“真正计算世界”
+- 第三个文件是在“把这个世界接进服务系统”
+
+这时候再回头看论文里的“统一 streaming/offline”，就不会再停留在一句概念话，而会变成一条你能在代码里逐段对上的实现链。
 
 ### 2.2 推理包装层
 
