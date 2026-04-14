@@ -71,6 +71,9 @@ def choose_dtype():
     """Pick a reasonable inference dtype from the available CUDA capability."""
     if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
         return torch.bfloat16
+    # FP16 is the fallback for older CUDA devices. CPU-only use is not the main
+    # target for this script, but returning a torch dtype here keeps the calling
+    # code simple.
     return torch.float16
 
 
@@ -81,6 +84,8 @@ def build_input_rows(args) -> List[Dict[str, object]]:
 
     rows: List[Dict[str, object]] = []
     if args.input_manifest:
+        # Manifest mode is useful when unlabeled audio still carries metadata such
+        # as prompts or custom path columns.
         manifest_rows = read_manifest_rows(args.input_manifest, fmt=args.input_format)
         for row in manifest_rows:
             if args.audio_key not in row:
@@ -93,14 +98,21 @@ def build_input_rows(args) -> List[Dict[str, object]]:
             rows.append(
                 {
                     "audio": audio,
+                    # Preserving prompt here matters because pseudo labeling
+                    # should ideally happen under the same conditioning context
+                    # that later training rows will use.
                     "prompt": ensure_prompt(row.get(args.prompt_key), args.default_prompt),
                 }
             )
     else:
+        # Directory mode is the simplest path when you only have a folder tree of
+        # unlabeled waveforms and no external manifest.
         for audio in collect_audio_files(args.audio_dir, recursive=(args.recursive == 1)):
             rows.append({"audio": audio, "prompt": args.default_prompt})
 
     if args.max_samples > 0:
+        # A quick cap is handy when validating pipeline correctness before
+        # generating pseudo labels for a large corpus.
         rows = rows[: args.max_samples]
     return rows
 
@@ -116,12 +128,16 @@ def load_model(args):
 
     backend_kwargs = json.loads(args.backend_kwargs_json)
     if args.backend == "transformers":
+        # The Transformers backend loads the full checkpoint locally and is the
+        # most straightforward teacher path for moderate batch sizes.
         return Qwen3ASRModel.from_pretrained(
             args.model_path,
             dtype=choose_dtype(),
             device_map=backend_kwargs.pop("device_map", "auto"),
             **backend_kwargs,
         )
+    # The vLLM backend keeps the same high-level API here, which lets the rest of
+    # the script ignore backend-specific details.
     return Qwen3ASRModel.LLM(model=args.model_path, **backend_kwargs)
 
 
@@ -131,7 +147,10 @@ def choose_target_language(args, detected_language: str) -> str:
     if not mode:
         return "None"
     if mode.lower() == "auto":
+        # ``auto`` means "trust the teacher's detected language and write that
+        # back into the training target protocol".
         return detected_language or "None"
+    # Any explicit language string forces a consistent prefix for every row.
     return mode
 
 
@@ -145,6 +164,9 @@ def main():
     args = parse_args()
     rows = build_input_rows(args)
     asr = load_model(args)
+    # ``decode_language`` controls teacher decoding behavior. It is different
+    # from ``train_language``, which controls the textual label protocol written
+    # into the output JSONL.
     decode_language = args.decode_language.strip() or None
     outputs: List[Dict[str, object]] = []
 
@@ -158,11 +180,16 @@ def main():
         for item, result in zip(batch, results):
             text = (result.text or "").strip()
             if args.skip_empty == 1 and not text:
+                # Empty teacher outputs are usually low-value training examples,
+                # so dropping them keeps the pseudo set cleaner by default.
                 continue
             detected_language = (result.language or "").strip()
             target_language = choose_target_language(args, detected_language)
             out = {
                 "audio": item["audio"],
+                # The pseudo dataset is written in the same target protocol as
+                # supervised rows so later mixed training can concatenate the two
+                # datasets with no format-specific branches.
                 "text": format_asr_target(text, language=target_language),
                 "loss_weight": float(args.loss_weight),
                 "pseudo": True,
@@ -173,6 +200,8 @@ def main():
                 out["prompt"] = item["prompt"]
             outputs.append(out)
 
+    # ``write_jsonl`` gives us a training-ready file that the semisupervised SFT
+    # script can consume directly.
     count = write_jsonl(args.output_file, outputs)
     print(f"[pseudo] input rows:  {len(rows)}")
     print(f"[pseudo] output rows: {count}")

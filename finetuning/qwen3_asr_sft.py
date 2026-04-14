@@ -16,11 +16,22 @@
 """
 Supervised fine-tuning script for Qwen3-ASR.
 
-The training recipe keeps the original multimodal prompt format intact: audio is
-still fed through the processor, and only the assistant-side transcription
-suffix contributes to the loss. This is important for ASR because the prompt
-contains structural tokens and audio placeholders that should not be optimized
-as targets.
+How to read this file conceptually:
+
+1. A training row starts life as ``{"audio": ..., "text": ..., "prompt": ...}``.
+2. We render the chat-template prefix once with ``apply_chat_template(...)`` and
+   store that textual prefix as ``prefix_text``.
+3. At batch time we load the real waveform, concatenate
+   ``prefix_text + target_text + eos``, and run the multimodal processor.
+4. We mask the prefix tokens in ``labels`` with ``-100`` so only the decoder-side
+   ASR answer contributes to the loss.
+5. Hugging Face ``Trainer`` then performs standard causal-LM optimization on
+   those unmasked target positions.
+
+The key design choice is that this script preserves the same multimodal prompt
+contract used at inference time. We are not training a separate ASR head with a
+CTC objective; we are continuing to teach the released Qwen3-ASR model how to
+generate the expected ASR answer format after seeing an audio-conditioned prompt.
 """
 
 import argparse
@@ -46,6 +57,12 @@ def patch_outer_forward(model):
     Trainer, however, expects ``model.forward`` to consume a batch dictionary and
     return a standard output object, so we proxy the call.
     """
+    # The checkpoint loaded by ``Qwen3ASRModel.from_pretrained`` exposes an outer
+    # Hugging Face module object whose real multimodal forward path lives under
+    # ``model.thinker``. Generation works through that wrapper already, but
+    # training with ``Trainer`` expects a callable ``model.forward(**batch)`` on
+    # the outer object. This patch gives Trainer exactly that entrypoint.
+    #
     # We patch the *class* instead of only one bound instance method because
     # Hugging Face wrappers may copy or rebind the model object during training.
     # A class-level patch keeps the behavior stable across those code paths.
@@ -70,6 +87,12 @@ def patch_outer_forward(model):
     ):
         # Keep the signature aligned with Trainer batch dictionaries. ``**kwargs``
         # makes the shim forward-compatible with extra tensors added upstream.
+        #
+        # The collator in this file emits the same multimodal tensor keys the
+        # thinker expects:
+        # - ``input_ids`` / ``attention_mask`` for the textual prompt side
+        # - ``input_features`` / ``feature_attention_mask`` for the audio encoder
+        # - ``labels`` for autoregressive supervision
         return self.thinker.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -108,12 +131,20 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
 def load_audio(path: str, sr: int = 16000):
     """Load one training waveform as mono audio at the target sample rate."""
+    # Using the same 16 kHz mono convention as inference keeps feature extraction
+    # consistent between training and deployment.
     wav, _ = librosa.load(path, sr=sr, mono=True)
     return wav
 
 
 def build_prefix_messages(prompt: str, audio_array):
     """Build the chat-style message skeleton used for prefix-only loss masking."""
+    # This mirrors the structure used by the inference wrapper:
+    # - ``system`` carries optional task instruction / context
+    # - ``user`` carries a multimodal content list with an ``audio`` slot
+    #
+    # The actual waveform may be omitted during cheap preprocessing because the
+    # chat template only needs to know that an audio segment will appear here.
     return [
         {"role": "system", "content": prompt or ""},
         {"role": "user", "content": [{"type": "audio", "audio": audio_array}]},
@@ -137,6 +168,10 @@ def make_preprocess_fn_prefix_only(processor):
         prefix_text = processor.apply_chat_template(
             [prefix_msgs], add_generation_prompt=True, tokenize=False
         )[0]
+        # The dataset keeps only the minimum information the collator needs later:
+        # - the raw audio path
+        # - the target ASR text (already normalized by data prep)
+        # - the rendered textual prefix that should *not* contribute to the loss
         return {
             "prompt": prompt,
             "audio": ex["audio"],
@@ -161,6 +196,9 @@ class DataCollatorForQwen3ASRFinetuning:
             learn to predict the transcription, not the prompt prefix nor padding
             tokens, so those label positions are set to ``-100``.
         """
+        # Each feature is still a lightweight Python dict from the dataset map
+        # stage. The collator is the first place where we actually touch the
+        # audio files and turn everything into tensors.
         audio_paths = [f["audio"] for f in features]
         prefix_texts = [f["prefix_text"] for f in features]
         targets = [f["target"] for f in features]
@@ -170,7 +208,8 @@ class DataCollatorForQwen3ASRFinetuning:
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
         audios = [load_audio(p, sr=self.sampling_rate) for p in audio_paths]
 
-        # ``full_inputs`` is the actual sequence we train on.
+        # ``full_inputs`` is the tensorized form of the *entire* teacher-forced
+        # sequence: chat prefix + expected ASR answer + EOS.
         full_inputs = self.processor(
             text=full_texts,
             audio=audios,
@@ -178,8 +217,14 @@ class DataCollatorForQwen3ASRFinetuning:
             padding=True,
             truncation=False,
         )
-        # ``prefix_inputs`` is a bookkeeping pass used only to recover the prefix
-        # boundary for each example.
+        # ``prefix_inputs`` is a second processor pass used only for bookkeeping.
+        # We intentionally feed the same audio here because we want the token
+        # boundary inside the exact multimodal sequence that the model will see.
+        #
+        # Why not estimate the prefix length from raw string length?
+        # Because tokenization, special tokens, and audio placeholder expansion
+        # are handled inside the processor. Asking the processor directly is the
+        # safest way to recover the true answer-start position.
         prefix_inputs = self.processor(
             text=prefix_texts,
             audio=audios,
@@ -196,10 +241,15 @@ class DataCollatorForQwen3ASRFinetuning:
         for i, pl in enumerate(prefix_lens):
             # HF loss helpers ignore ``-100`` positions when computing
             # cross-entropy, so the prompt prefix does not contribute to the loss.
+            #
+            # After this assignment, the model is optimized only on the target
+            # suffix, not on the structural prompt tokens that set up the task.
             labels[i, :pl] = -100
 
         pad_id = self.processor.tokenizer.pad_token_id
         if pad_id is not None:
+            # Padding is also masked because it is an artifact of batching, not
+            # something the model should try to predict.
             labels[labels == pad_id] = -100
 
         # Trainer forwards this to ``model(..., labels=labels)``, and the model's
@@ -219,6 +269,8 @@ class CastFloatInputsTrainer(Trainer):
                 if torch.is_tensor(v) and v.is_floating_point():
                     # Audio features are floating tensors; matching the model
                     # dtype avoids unnecessary mixed-precision casts later.
+                    # Integer tensors such as ``input_ids`` are intentionally
+                    # left untouched.
                     inputs[k] = v.to(dtype=model_dtype)
         return inputs
 
@@ -228,6 +280,10 @@ def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
     os.makedirs(dst_dir, exist_ok=True)
     # Multimodal checkpoints are not self-describing from weights alone. The
     # processor config, tokenizer vocab and chat template are part of inference.
+    #
+    # Without these sidecar files, a saved ``checkpoint-*`` directory might have
+    # the fine-tuned weights but still be impossible to reload correctly through
+    # ``Qwen3ASRModel.from_pretrained(...)`` or Hugging Face auto classes.
     required = [
         "config.json",
         "generation_config.json",
@@ -254,6 +310,8 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
 
     def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
+            # In distributed training only rank 0 performs the metadata copy to
+            # avoid redundant writes to the same checkpoint directory.
             return control
 
         # Different Trainer save code paths expose the checkpoint path in
@@ -324,6 +382,9 @@ def main():
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
     )
+    # ``Qwen3ASRModel`` is a convenience wrapper used heavily by inference code.
+    # For SFT we only need the underlying HF model plus the shared multimodal
+    # processor, so we unwrap them immediately.
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
@@ -345,11 +406,16 @@ def main():
     keep = {"prompt", "audio", "target", "prefix_text"}
     for split in ds.keys():
         # Drop unused JSON columns early so the dataloader only carries the
-        # fields required by the collator.
+        # fields required by the collator. This keeps dataset examples easy to
+        # inspect and avoids accidentally carrying unrelated annotation columns
+        # through the whole training pipeline.
         drop = [c for c in ds[split].column_names if c not in keep]
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
+    # From this point onward the data flow is:
+    # dataset example -> collator builds tensors -> trainer calls model.forward
+    # -> model computes autoregressive loss on the unmasked target suffix.
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
 
     training_args = TrainingArguments(

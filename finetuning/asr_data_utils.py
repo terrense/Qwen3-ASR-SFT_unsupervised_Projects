@@ -91,6 +91,8 @@ def read_manifest_rows(path: str, fmt: str = "auto") -> List[Dict[str, object]]:
 
     delimiter = "," if fmt == "csv" else "\t"
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        # ``utf-8-sig`` quietly handles BOM-prefixed spreadsheet exports, which
+        # are common when manifests were last touched by Excel-like tools.
         reader = csv.DictReader(f, delimiter=delimiter)
         return [dict(row) for row in reader]
 
@@ -131,8 +133,12 @@ def resolve_audio_path(
     for cand in candidates:
         cand_abs = os.path.abspath(cand)
         if os.path.exists(cand_abs):
+            # Returning the first existing candidate gives us a deterministic and
+            # easy-to-explain search policy for relative paths.
             return cand_abs
 
+    # If nothing exists yet, we still return the first candidate as a useful
+    # "best effort" resolution for later error messages or downstream checks.
     return os.path.abspath(candidates[0])
 
 
@@ -147,6 +153,8 @@ def ensure_prompt(prompt: object, default_prompt: str = "") -> str:
     if prompt is None:
         return default_prompt
     text = str(prompt).strip()
+    # Empty strings collapse back to the caller's default so downstream code
+    # never needs to distinguish between ``None``, whitespace, and missing keys.
     return text if text else default_prompt
 
 
@@ -167,8 +175,13 @@ def format_asr_target(text: str, language: str = "Chinese") -> str:
     if not text:
         raise ValueError("transcript text is empty")
     if has_asr_prefix(text):
+        # Respect preformatted training targets so advanced users can supply
+        # custom protocol strings without this helper rewriting them.
         return text
 
+    # ``None`` is a valid training-time fallback when language metadata is
+    # unavailable. The model will still learn ASR, just not an explicit language
+    # classification signal from the prefix.
     lang = str(language).strip() or "None"
     return f"language {lang}<asr_text>{text}"
 
@@ -179,6 +192,8 @@ def write_jsonl(path: str, rows: Iterable[Dict[str, object]]) -> int:
     count = 0
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
+            # ``ensure_ascii=False`` preserves non-ASCII transcripts such as
+            # Chinese text in a human-readable form.
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1
     return count
@@ -214,6 +229,8 @@ def split_rows(
 
     eval_count = int(round(len(rows) * eval_ratio))
     if len(rows) > 1:
+        # Clamp the eval size so quick experiments still keep at least one
+        # training sample and one eval sample when possible.
         eval_count = max(1, min(eval_count, len(rows) - 1))
     else:
         eval_count = 0
@@ -245,6 +262,8 @@ def collect_audio_files(audio_dir: str, recursive: bool = True) -> List[str]:
             if os.path.isfile(path) and os.path.splitext(name)[1].lower() in AUDIO_EXTENSIONS:
                 collected.append(os.path.abspath(path))
 
+    # Stable sorting is especially useful for pseudo labeling because it makes it
+    # easier to compare outputs across runs and to resume manual inspection.
     collected.sort()
     return collected
 
@@ -260,4 +279,6 @@ def batched(items: Sequence[object], batch_size: int) -> Iterator[Sequence[objec
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     for start in range(0, len(items), batch_size):
+        # Slicing keeps the helper simple and works well because the calling
+        # scripts already materialize the full list of items in memory.
         yield items[start:start + batch_size]

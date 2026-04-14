@@ -1,21 +1,23 @@
 """Semi-supervised SFT script built on top of the stock ``qwen3_asr_sft.py``.
 
-The original repository already provides supervised fine-tuning against
-``audio -> transcript`` JSONL pairs. This extension adds one practical feature:
-mixing high-quality supervised labels with lower-confidence pseudo labels in the
-same training run.
+This file preserves the exact same multimodal training contract as the
+supervised recipe:
 
-The key idea is intentionally simple:
+- the prompt is still rendered with the Qwen3-ASR chat template,
+- the real waveform is still loaded inside the collator,
+- the target is still the decoder-side ASR answer suffix,
+- prefix tokens are still masked out with ``-100``.
 
-1. Both supervised and pseudo-labeled samples are converted into the same input
-   format.
-2. The collator still builds one multimodal prompt and one decoder target per
-   example.
-3. Instead of averaging all sample losses equally, the trainer applies a
-   per-sample weight so pseudo labels influence the model more gently.
+The only conceptual extension is that the training set may now contain multiple
+sample sources with different trust levels:
 
-This keeps the training recipe close to the stock script while making it useful
-for dialect adaptation scenarios where unlabeled audio is abundant.
+1. Human-labeled supervised rows
+2. Teacher-generated pseudo-labeled rows
+
+Instead of branching the model or processor logic, we attach metadata
+(``loss_weight`` and ``source``) to each row and change only the final loss
+reduction. That keeps the semisupervised pipeline easy to reason about: the
+model still solves the same task, but noisier examples count less.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ if REPO_ROOT not in sys.path:
 
 def build_prefix_messages(prompt: str, audio_array):
     """Build the minimal chat-template structure expected by the processor."""
+    # This is intentionally the same message shape used in the supervised SFT
+    # script so that both recipes share one prompt contract.
     return [
         {"role": "system", "content": prompt or ""},
         {"role": "user", "content": [{"type": "audio", "audio": audio_array}]},
@@ -47,6 +51,8 @@ def load_audio(path: str, sr: int = 16000):
     """Load one waveform as mono audio at the requested sample rate."""
     import librosa
 
+    # Keeping waveform loading local to the collator avoids paying I/O cost
+    # during dataset preprocessing and mirrors the stock SFT data flow.
     wav, _ = librosa.load(path, sr=sr, mono=True)
     return wav
 
@@ -72,6 +78,8 @@ def make_preprocess_fn_prefix_only(processor):
             "audio": ex["audio"],
             "target": ex["text"],
             "prefix_text": prefix_text,
+            # ``loss_weight`` is preserved at row level so the trainer can later
+            # decide how strongly each example should affect optimization.
             "loss_weight": float(ex.get("loss_weight", 1.0)),
             "source": str(ex.get("source", "supervised")),
         }
@@ -92,6 +100,9 @@ class DataCollatorForQwen3ASRSemiSup:
             ``-100`` so only the decoder-side transcription suffix contributes to
             the language-model loss.
         """
+        # The only fields that change semantically versus the supervised collator
+        # are the extra metadata tensors such as ``loss_weight``. The multimodal
+        # prompt construction itself remains the same on purpose.
         audio_paths = [f["audio"] for f in features]
         prefix_texts = [f["prefix_text"] for f in features]
         targets = [f["target"] for f in features]
@@ -104,6 +115,8 @@ class DataCollatorForQwen3ASRSemiSup:
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
         audios = [load_audio(path, sr=self.sampling_rate) for path in audio_paths]
 
+        # First pass: the real supervised sequence the model should learn to
+        # generate after seeing the audio-conditioned prefix.
         full_inputs = self.processor(
             text=full_texts,
             audio=audios,
@@ -111,6 +124,8 @@ class DataCollatorForQwen3ASRSemiSup:
             padding=True,
             truncation=False,
         )
+        # Second pass: prefix-only encoding used strictly to recover the point
+        # where the assistant answer begins in token space.
         prefix_inputs = self.processor(
             text=prefix_texts,
             audio=audios,
@@ -122,6 +137,8 @@ class DataCollatorForQwen3ASRSemiSup:
         prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
         labels = full_inputs["input_ids"].clone()
         for i, prefix_len in enumerate(prefix_lens):
+            # Exactly like the supervised recipe, the model should not be trained
+            # to reproduce prompt scaffolding or audio placeholder structure.
             labels[i, :prefix_len] = -100
 
         pad_id = self.processor.tokenizer.pad_token_id
@@ -129,6 +146,8 @@ class DataCollatorForQwen3ASRSemiSup:
             labels[labels == pad_id] = -100
 
         full_inputs["labels"] = labels
+        # ``loss_weight`` does not go into the model forward itself. It is
+        # consumed later by the custom Trainer loss reduction.
         full_inputs["loss_weight"] = loss_weights
         return full_inputs
 
@@ -151,6 +170,8 @@ def build_trainer_class():
             if model_dtype is not None:
                 for key, value in list(inputs.items()):
                     if torch.is_tensor(value) and value.is_floating_point():
+                        # This affects audio features and the extra weight tensor.
+                        # Integer token ids remain untouched.
                         inputs[key] = value.to(dtype=model_dtype)
             return inputs
 
@@ -166,10 +187,13 @@ def build_trainer_class():
             outputs = model(**inputs)
 
             if loss_weight is None or labels is None:
+                # Fall back to the stock model loss when weights are absent.
                 loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
                 return (loss, outputs) if return_outputs else loss
 
             logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+            # We manually apply the usual causal-LM shift because we are
+            # re-implementing the reduction step outside the model.
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             vocab_size = shift_logits.size(-1)
@@ -182,9 +206,13 @@ def build_trainer_class():
             ).view_as(shift_labels)
             token_mask = shift_labels.ne(-100)
             sample_token_count = token_mask.sum(dim=1).clamp_min(1)
+            # First average inside each sample so long utterances do not dominate
+            # short ones purely because they have more supervised tokens.
             sample_losses = token_losses.sum(dim=1) / sample_token_count
             weights = loss_weight.to(sample_losses.device, dtype=sample_losses.dtype).clamp_min(0.0)
             denom = weights.sum().clamp_min(torch.finfo(sample_losses.dtype).eps)
+            # Then form a weighted batch mean so pseudo labels can contribute more
+            # gently than human-labeled rows.
             loss = (sample_losses * weights).sum() / denom
             return (loss, outputs) if return_outputs else loss
 
@@ -232,6 +260,8 @@ def load_json_dataset(path: str):
     """Load one JSON/JSONL dataset split with the Hugging Face datasets library."""
     from datasets import load_dataset
 
+    # The returned split is always named ``train`` here because we are loading a
+    # single file at a time before later deciding how to combine it.
     ds = load_dataset("json", data_files={"train": path})
     return ds["train"]
 
@@ -240,6 +270,8 @@ def maybe_trim_dataset(ds, max_samples: int, seed: int):
     """Optionally downsample a dataset for ablations or smoke tests."""
     if max_samples <= 0 or len(ds) <= max_samples:
         return ds
+    # Shuffle before select so truncation is not biased toward the file's
+    # original ordering.
     return ds.shuffle(seed=seed).select(range(max_samples))
 
 
@@ -247,6 +279,8 @@ def attach_metadata(ds, default_weight: float, source: str):
     """Attach normalized metadata columns expected by the mixed-training pipeline."""
     def _map(ex):
         out = dict(ex)
+        # Preserve row-level weights when the JSONL already contains them, but
+        # provide a sensible default for plain supervised manifests.
         out["loss_weight"] = float(ex.get("loss_weight", default_weight))
         out["source"] = str(ex.get("source", source))
         out["prompt"] = str(ex.get("prompt", "") or "")
@@ -270,6 +304,8 @@ def build_train_dataset(args, processor):
 
     pieces: List[Dataset] = []
     if supervised_path:
+        # Supervised rows either inherit ``loss_weight=1.0`` or keep an explicit
+        # row-level weight if one is already present in the JSONL.
         ds_sup = load_json_dataset(supervised_path)
         ds_sup = maybe_trim_dataset(ds_sup, args.max_supervised_samples, args.mix_seed)
         ds_sup = attach_metadata(ds_sup, args.supervised_loss_weight, "supervised")
@@ -277,6 +313,8 @@ def build_train_dataset(args, processor):
         print(f"[dataset] supervised rows: {len(ds_sup)}")
 
     if args.pseudo_train_file:
+        # Pseudo rows are structurally identical to supervised rows, which is why
+        # simple concatenation works after metadata normalization.
         ds_pseudo = load_json_dataset(args.pseudo_train_file)
         ds_pseudo = maybe_trim_dataset(ds_pseudo, args.max_pseudo_samples, args.mix_seed)
         ds_pseudo = attach_metadata(ds_pseudo, args.pseudo_loss_weight, "pseudo")
@@ -284,6 +322,8 @@ def build_train_dataset(args, processor):
         print(f"[dataset] pseudo rows:     {len(ds_pseudo)}")
 
     merged = pieces[0] if len(pieces) == 1 else concatenate_datasets(pieces)
+    # Shuffle after concatenation so batches are not dominated by one source for
+    # long stretches.
     merged = merged.shuffle(seed=args.mix_seed)
     processed = merged.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
     keep = {"prompt", "audio", "target", "prefix_text", "loss_weight", "source"}
@@ -300,6 +340,8 @@ def build_eval_dataset(args, processor):
         return None
     from datasets import load_dataset
 
+    # Eval rows keep the same tensor contract so the trainer can reuse the same
+    # collator and model path with no special casing.
     ds_eval = load_dataset("json", data_files={"validation": args.eval_file})["validation"]
     ds_eval = attach_metadata(ds_eval, 1.0, "eval")
     ds_eval = ds_eval.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
@@ -329,6 +371,8 @@ def main():
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
     )
+    # As in the supervised recipe, we unwrap the convenience wrapper into the
+    # actual HF model object plus the shared multimodal processor.
     model = asr_wrapper.model
     processor = asr_wrapper.processor
 
@@ -380,6 +424,8 @@ def main():
         callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args.model_path)],
     )
 
+    # Resume behavior intentionally matches the supervised script so experiments
+    # can switch between recipes without changing checkpoint management habits.
     resume_from = (args.resume_from or "").strip()
     if not resume_from and args.resume == 1:
         resume_from = find_latest_checkpoint(training_args.output_dir) or ""

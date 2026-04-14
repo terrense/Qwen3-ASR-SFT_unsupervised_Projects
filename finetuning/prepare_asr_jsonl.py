@@ -1,7 +1,9 @@
 """Prepare Qwen3-ASR fine-tuning manifests from labeled corpora.
 
-This script sits between raw human annotation exports and the repository's
-training script. In practice it solves three recurring problems:
+This script is the normalization bridge between "real-world annotation exports"
+and the much stricter JSONL schema expected by the fine-tuning scripts.
+
+In practice it solves three recurring problems:
 
 1. Annotation tools often export CSV/TSV, while training prefers JSONL.
 2. Audio paths in datasets are frequently relative and need to be resolved
@@ -61,6 +63,8 @@ def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
     if args.text_key not in row:
         raise KeyError(f"Missing text column: {args.text_key}")
 
+    # Path resolution is delegated to ``asr_data_utils`` so this script can stay
+    # focused on manifest normalization rather than filesystem policy.
     audio = resolve_audio_path(
         str(row[args.audio_key]),
         manifest_path=args.input_manifest,
@@ -69,6 +73,9 @@ def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
     if not os.path.exists(audio):
         raise FileNotFoundError(audio)
 
+    # The training scripts expect the target side to follow the Qwen3-ASR textual
+    # protocol, not just raw transcript text. ``format_asr_target`` adds that
+    # protocol wrapper only when it is missing, so preformatted rows remain valid.
     text = format_asr_target(str(row[args.text_key]), language=args.language)
     prompt = ensure_prompt(row.get(args.prompt_key), args.default_prompt)
 
@@ -77,6 +84,8 @@ def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
         "text": text,
     }
     if prompt:
+        # Prompt is optional. We only materialize it when non-empty so the output
+        # JSONL stays compact and visually easy to inspect.
         item["prompt"] = prompt
     return item
 
@@ -84,6 +93,8 @@ def normalize_row(row: Dict[str, object], args) -> Dict[str, object]:
 def main():
     """Run end-to-end manifest loading, normalization, splitting and writing."""
     args = parse_args()
+    # ``read_manifest_rows`` hides the source format differences so the rest of
+    # this script can treat every input as ``List[Dict[str, object]]``.
     rows = read_manifest_rows(args.input_manifest, fmt=args.input_format)
     normalized: List[Dict[str, object]] = []
     skipped_missing = 0
@@ -93,10 +104,15 @@ def main():
             normalized.append(normalize_row(row, args))
         except FileNotFoundError:
             if args.skip_missing_audio == 1:
+                # Some annotation exports contain stale paths. Allowing a skip
+                # mode is convenient for quick dataset cleanup without rewriting
+                # the source manifest first.
                 skipped_missing += 1
                 continue
             raise FileNotFoundError(f"Missing audio for row {idx}")
 
+    # Splitting happens after normalization so both train and eval sets share the
+    # same canonical schema and absolute-path policy.
     train_rows, eval_rows = split_rows(
         normalized,
         eval_ratio=args.eval_ratio if args.output_eval else 0.0,
@@ -108,6 +124,7 @@ def main():
     print(f"[prepare] wrote train rows: {train_count} -> {args.output_train}")
 
     if args.output_eval:
+        # ``output_eval`` being empty is the switch for "train only" mode.
         eval_count = write_jsonl(args.output_eval, eval_rows)
         print(f"[prepare] wrote eval rows:  {eval_count} -> {args.output_eval}")
 
