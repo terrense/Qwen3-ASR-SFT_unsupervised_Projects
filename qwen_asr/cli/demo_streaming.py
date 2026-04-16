@@ -26,6 +26,13 @@ The implementation uses Flask and an in-memory session table on purpose. It is
 not a production deployment template; it is a compact reference for how the
 streaming state machine exposed by ``Qwen3ASRModel`` can be driven over HTTP.
 """
+
+# 中文学习备注：
+# 这个文件展示的是“流式 ASR 状态机如何被一个极简 Web 服务驱动”。
+# 它不是生产级部署模板，但非常适合理解三件事：
+# - 浏览器音频流如何切成 chunk
+# - 服务端如何为每个会话保存 `ASRStreamingState`
+# - 结束录音时为什么还需要一次 `finish_streaming_transcribe()`
 import argparse
 import time
 import uuid
@@ -50,6 +57,9 @@ app = Flask(__name__)
 
 # These globals are initialized in ``main()`` exactly once, then read by the
 # request handlers. This is acceptable for a single-process demo server.
+# 中文学习备注：
+# 这里用全局变量是为了把 demo 尽量写短。
+# 在正式服务里，通常会把这些对象放进更明确的应用状态容器里。
 global asr
 global UNFIXED_CHUNK_NUM
 global UNFIXED_TOKEN_NUM
@@ -487,6 +497,9 @@ def api_finish():
 
 def parse_args():
     """Parse server, model and streaming-hyperparameter arguments."""
+    # 这些参数本质上分成两类：
+    # - 服务参数：host / port
+    # - streaming 行为参数：chunk 大小、prefix 回退策略
     p = argparse.ArgumentParser(description="Qwen3-ASR Streaming Web Demo (vLLM backend)")
     p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B", help="Model name or local path")
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
@@ -512,6 +525,8 @@ def main():
     UNFIXED_TOKEN_NUM = args.unfixed_token_num
     CHUNK_SIZE_SEC = args.chunk_size_sec
 
+    # 这里模型只初始化一次，之后所有 HTTP 请求共享它。
+    # 每个 session 的差异不在模型，而在对应的 `state` 对象。
     asr = Qwen3ASRModel.LLM(
         model=args.asr_model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,

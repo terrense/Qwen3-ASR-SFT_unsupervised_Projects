@@ -23,6 +23,16 @@ multimodal prompt. Conceptually it performs two jobs:
    sees exactly as many multimodal slots as the audio encoder will output.
 """
 
+# 中文学习备注：
+# `processor` 在 Hugging Face 体系里经常容易被低估，但对多模态模型来说它非常关键。
+# 这里它不是单纯的“前处理工具”，而是在维护一个严格的长度契约：
+#
+# - 音频侧会产出多少个连续 feature 向量
+# - 文本 prompt 里就必须预留多少个占位 token 位置
+#
+# 如果这两边数量不一致，后面模型里的 `masked_scatter` 就无法把 audio embeddings
+# 填进文本 embedding 序列。因此本文件的本质任务是：
+# “让文本侧 placeholder 计数，和音频侧 encoder 输出长度完全同步”。
 from __future__ import annotations
 
 from collections import deque
@@ -90,6 +100,8 @@ def _get_feat_extract_output_lengths(input_lengths):
     # - processor 以为要插 N 个 audio placeholder
     # - audio_tower 实际产出 M 个 feature
     # - 后面的 embedding 注入会直接 shape 对不上
+    #
+    # 所以虽然它只是一个长度公式，但它实际上是 processor 和 model 之间的“暗合同”。
 
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -119,6 +131,9 @@ class Qwen3ASRProcessor(ProcessorMixin):
     # `ProcessorMixin` 是 HF 的“组合处理器”基类。
     # 它允许把 feature_extractor 和 tokenizer 绑成一个统一入口，
     # 这样用户只需要 `processor(text=..., audio=...)` 就能同时处理文本和音频。
+    #
+    # 对 Qwen3-ASR 来说，这种组合尤其重要，因为文本和音频不是彼此独立预处理，
+    # 而是要在“占位符长度”这个点上严格对齐。
 
     def __init__(
         self, feature_extractor=None, tokenizer=None, chat_template=None
@@ -163,6 +178,9 @@ class Qwen3ASRProcessor(ProcessorMixin):
         # 也有 feature extractor 产出的：
         # - input_features
         # - feature_attention_mask
+        #
+        # 从调用链上看，这个函数的输出会直接进入：
+        # `Qwen3ASRForConditionalGeneration.generate(**inputs)`。
 
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
@@ -201,6 +219,8 @@ class Qwen3ASRProcessor(ProcessorMixin):
             audio_length_values = np.asarray(
                 _get_feat_extract_output_lengths(audio_inputs["feature_attention_mask"].sum(-1))
             ).reshape(-1)
+            # 这里把长度转成 deque，而不是普通 list，是因为后面的文本替换过程
+            # 会按照 prompt 中 placeholder 出现的先后顺序逐个消费这些长度值。
             audio_lengths = deque(int(length) for length in audio_length_values.tolist())
         else:
             audio_inputs = {}
@@ -211,6 +231,9 @@ class Qwen3ASRProcessor(ProcessorMixin):
         # 中文学习备注：
         # 这一步非常关键：它会把 prompt 里“逻辑上的一个音频 token”
         # 替换成“重复 N 次的 audio_token”，其中 N = audio encoder 输出长度。
+        #
+        # 从“抽象 API”角度看，调用者只写了一个音频占位符；
+        # 从“底层张量对齐”角度看，模型真正需要的是一整段连续占位位置。
 
         if audio_lengths:
             raise ValueError("Received more audio inputs than audio placeholder tokens in `text`.")
@@ -252,6 +275,8 @@ class Qwen3ASRProcessor(ProcessorMixin):
         # 输出：
         # - processed_text: List[str]
         #   其中每个 `<audio_token>` 都已经被替换成重复 N 次的 audio_token 串
+        #
+        # 这个函数其实就是在做“逻辑音频片段 -> 真实序列槽位”的展开。
 
         processed_text: list[str] = []
         for sample in text:
@@ -285,6 +310,8 @@ class Qwen3ASRProcessor(ProcessorMixin):
             # 中文学习备注：
             # 这里先用临时字符串占位，再统一替回真正的 audio_token，
             # 是为了避免在重复替换时相互影响。
+            #
+            # 否则一边 replace 一边又产生新的 `self.audio_token`，很容易把刚替换出来的内容再次命中。
             processed_text.append(sample)
         return processed_text
 
@@ -336,6 +363,8 @@ class Qwen3ASRProcessor(ProcessorMixin):
         # 中文学习备注：
         # 这里把 tokenizer 和 feature extractor 两边的输入字段合并起来，
         # 再额外补上 `feature_attention_mask`。
+        # 这决定了上游 pipeline / Trainer / generate 调用在收集模型输入时，
+        # 会把哪些字段当作这个 processor/model 组合的标准输入集合。
         return list(
             dict.fromkeys(
                 tokenizer_input_names

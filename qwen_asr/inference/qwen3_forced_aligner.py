@@ -25,6 +25,18 @@ boundaries. The code below therefore has two distinct responsibilities:
    into structured spans.
 """
 
+# 中文学习备注：
+# 这个文件和普通 ASR 最大的区别在于：它不负责“听写出文本”，而负责“已知文本时把时间对齐出来”。
+# 所以这里的输入契约变成了：
+# - audio：音频
+# - text：参考文本
+# - language：如何切分这段文本
+#
+# 也因此它天然分成两层：
+# 1. `Qwen3ForceAlignProcessor`
+#    负责按语言把文本切成可对齐单元，并把模型输出的 timestamp 序列修正、还原。
+# 2. `Qwen3ForcedAligner`
+#    负责调模型、调 HF processor，并把最终结果包装成结构化 dataclass。
 import os
 import unicodedata
 from dataclasses import dataclass
@@ -54,6 +66,11 @@ class Qwen3ForceAlignProcessor():
     strings. This processor therefore decides how to tokenize text for different
     writing systems and how to repair the predicted timestamp sequence.
     """
+    # 这个类更像“语言学侧处理器”，不是神经网络本体。
+    # 它决定：
+    # - 中文按字对齐还是按词对齐
+    # - 日文、韩文用什么分词器
+    # - 模型给出的时间戳序列如果不单调，要怎么修复
 
     def __init__(self):
         # Korean tokenization uses a lightweight scored lexicon. Loading it once
@@ -296,6 +313,9 @@ class Qwen3ForceAlignProcessor():
         The model expects ``<timestamp>`` separators between alignment units and
         an explicit audio placeholder prefix before the text portion.
         """
+        # 这一步是在把“普通文本”转换成“对齐模型专用 prompt 格式”。
+        # 关键思想是：模型不是直接预测每个词的开始/结束时间对象，
+        # 而是在 `<timestamp>` 标记位上输出时间索引。
         language = language.lower()
 
         if language.lower() == "japanese":
@@ -312,6 +332,7 @@ class Qwen3ForceAlignProcessor():
         
         # Each token contributes two alignment slots: start timestamp and end
         # timestamp. The prompt therefore inserts two markers per token.
+        # 所以如果最终分出了 N 个对齐单元，就会需要 2N 个 timestamp 位置。
         input_text = "<timestamp><timestamp>".join(word_list) + "<timestamp><timestamp>"
         input_text = "<|audio_start|><|audio_pad|><|audio_end|>" + input_text
 
@@ -384,6 +405,8 @@ class Qwen3ForcedAligner:
       - batch and single-sample forced alignment
       - structured output with attribute access (`.text`, `.start_time`, `.end_time`)
     """
+    # 这是给用户直接用的高层封装，定位上和 `Qwen3ASRModel` 类似，
+    # 只是任务从 ASR 变成了 forced alignment。
 
     def __init__(
         self,
@@ -398,6 +421,9 @@ class Qwen3ForcedAligner:
         the Hugging Face processor handles multimodal tensor preparation, while
         ``Qwen3ForceAlignProcessor`` handles linguistic segmentation.
         """
+        # 这里特意把“模型处理”和“语言切分处理”拆成两个 processor：
+        # - `processor` 负责音频/文本张量输入准备
+        # - `aligner_processor` 负责词粒度切分和时间戳序列修复
         self.model = model
         self.processor = processor
         self.aligner_processor = aligner_processor
@@ -439,6 +465,7 @@ class Qwen3ForcedAligner:
             Qwen3ForcedAligner:
                 Initialized wrapper instance.
         """
+        # 这里和 ASR 主封装一样，先注册自定义架构，再走 HF Auto 类恢复模型和 processor。
         AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
         AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)
         AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
@@ -493,6 +520,12 @@ class Qwen3ForcedAligner:
                 One result per sample. Each result contains `items`, and each token can be accessed via
                 `.text`, `.start_time`, `.end_time`.
         """
+        # 可以把 `align()` 理解成 5 步：
+        # 1. 把 audio/text/language 统一成 batch list
+        # 2. 按语言把参考文本切成可对齐单元
+        # 3. 构造 forced-align 专用 prompt
+        # 4. 调模型得到 timestamp token 预测
+        # 5. 把时间索引还原成秒级结构化 span
         # Scalar-or-batch normalization lets the public API stay ergonomic while
         # the model path only needs to reason about aligned Python lists.
         texts = ensure_list(text)
@@ -527,6 +560,8 @@ class Qwen3ForcedAligner:
         # Forced alignment is framed as timestamp-token classification. We call
         # the thinker directly and take the argmax because we need token-level
         # boundary predictions rather than free-form text generation.
+        # 这也是它和普通 ASR 的关键区别：这里不需要 `generate()`，
+        # 因为目标不是生成自然语言，而是在 timestamp 位置做分类/选择。
         logits = self.model.thinker(**inputs).logits
         output_ids = logits.argmax(dim=-1)
 

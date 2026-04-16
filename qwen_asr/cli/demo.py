@@ -33,6 +33,14 @@ The code is therefore a good example of how to build a thin application shell
 around the repository's public inference APIs without touching model internals.
 """
 
+# 中文学习备注：
+# 这个文件很适合用来学习“如何把 `Qwen3ASRModel` 包成一个真实应用”。
+# 它并不关心模型内部张量细节，而是专注三件事：
+# - UI 输入长什么样
+# - 怎么把 UI 输入整理成 `Qwen3ASRModel` 能接受的参数
+# - 怎么把识别结果再转回用户可看的文本 / JSON / HTML
+#
+# 所以当你以后想接 FastAPI、Flask、桌面应用时，这个文件就是很好的应用层参考。
 import argparse
 import base64
 import io
@@ -392,6 +400,8 @@ def build_demo(
     still flows through ``Qwen3ASRModel`` so the demo matches the programmatic
     API as closely as possible.
     """
+    # 这个函数的职责是“拼 UI”，不是“执行业务逻辑”。
+    # 真正的识别仍然在内部的 `run(...)` 回调里，并继续复用高层 ASR 封装。
     supported_langs_raw = asr.get_supported_languages()
     lang_choices_disp, lang_map = _build_choices_and_map([x for x in supported_langs_raw])
     lang_choices = ["Auto"] + lang_choices_disp
@@ -454,6 +464,10 @@ def build_demo(
 
         def run(audio_upload: Any, lang_disp: str, return_ts: bool):
             """Execute one transcription request from the UI widgets."""
+            # 从 UI 回调视角看，这一步只是把 Gradio 控件值翻译成公共 API 参数：
+            # audio_upload -> audio
+            # lang_disp    -> language
+            # checkbox     -> return_time_stamps
             audio_obj = _parse_audio_any(audio_upload)
 
             language = None
@@ -500,6 +514,7 @@ def build_demo(
 
         def visualize(audio_upload: Any, timestamps_json: Any):
             """Render token-level timestamp slices as inline HTML audio players."""
+            # 这里没有重新跑模型，只是把已有时间戳结果做前端可视化。
             return _make_timestamp_html(audio_upload, timestamps_json)
 
         if has_aligner:
@@ -549,6 +564,8 @@ def main(argv=None) -> int:
 
     # The demo keeps backend selection at the boundary. Once the wrapper is
     # created, the UI below can remain backend-agnostic.
+    # 这也是这个 demo 的一个很好的架构点：
+    # “后端差异只存在于初始化边界，UI 逻辑完全不需要知道底层是 HF 还是 vLLM”。
     if backend == "transformers":
         asr = Qwen3ASRModel.from_pretrained(
             asr_ckpt,

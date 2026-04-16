@@ -36,6 +36,9 @@ from qwen_asr.core.transformers_backend import (
 )
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
+# 中文学习备注：
+# 这里重复做一遍注册，不是多余，而是因为这个文件本身就可能被当作独立 CLI 入口直接运行。
+# 如果不在启动服务前显式注册，自定义 `qwen3_asr` 架构对 vLLM / HF auto 类来说就是“未知模型”。
 AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
 AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)
 AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
@@ -58,6 +61,9 @@ def main():
     Mutating ``sys.argv`` is a simple way to reuse vLLM's command-line parser
     without copying its entrypoint implementation.
     """
+    # 这招的本质是“借壳”：
+    # Qwen3-ASR 只负责在进入 vLLM CLI 之前完成必要注册，
+    # 真正的参数解析和服务启动逻辑仍然完全交给上游 vLLM。
     sys.argv.insert(1, "serve")
     vllm_main()
 

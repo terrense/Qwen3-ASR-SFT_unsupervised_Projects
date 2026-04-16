@@ -22,4 +22,12 @@ hooks. Re-exporting the main class here keeps the higher-level inference code
 backend-agnostic.
 """
 
+# 中文学习备注：
+# 这个 `__init__.py` 和 transformers backend 的同名文件作用类似，
+# 都是在给上层推理封装提供一个更短、更稳定的导入入口。
+# 区别在于这里暴露的是“只适用于 vLLM 运行时”的那套模型实现。
+#
+# 所以当你在 `inference/qwen3_asr.py` 里看到：
+# `from qwen_asr.core.vllm_backend import Qwen3ASRForConditionalGeneration`
+# 本质上就是通过这里把 vLLM 专用模型类接进上层封装。
 from .qwen3_asr import Qwen3ASRForConditionalGeneration

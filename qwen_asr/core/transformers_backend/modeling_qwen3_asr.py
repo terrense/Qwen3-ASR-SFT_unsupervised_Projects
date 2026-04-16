@@ -75,6 +75,14 @@ from .configuration_qwen3_asr import (
 # -> `Qwen3ASRThinkerForConditionalGeneration.get_audio_features`
 # -> `get_placeholder_mask`
 # -> `masked_scatter`
+#
+# 再换一种更偏“数据流”的理解方式：
+# `input_features`
+# -> audio tower
+# -> `audio_features`
+# -> 找到 prompt 中的 audio placeholder 位置
+# -> 用 `masked_scatter` 把这些位置替换成连续音频向量
+# -> 文本 decoder 继续把整条 embedding 序列当普通上下文做自回归生成
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -1375,6 +1383,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
     # 1. 调 audio_tower 把音频转成连续向量
     # 2. 把这些向量替换进 prompt 的音频占位符
     # 3. 调文本 decoder 自回归生成识别结果
+    #
+    # 也可以把它理解成“多模态桥接层”：
+    # - 音频塔负责把连续声学输入变成更短的特征序列
+    # - 文本 decoder 负责从统一的 embedding 上下文里继续生成 token
+    # - Thinker 负责把两者在 embedding 空间里接起来
     config: Qwen3ASRThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
@@ -1390,6 +1403,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
     def __init__(self, config):
         super().__init__(config)
         # 中文学习备注：audio_tower 负责“听”，model/lm_head 负责“写”。
+        # 这里的模块拆分非常重要：
+        # - `audio_tower` 只处理语音编码
+        # - `model` 是文本 decoder 主体
+        # - `lm_head` 把 hidden_states 投到词表空间
         self.audio_tower = Qwen3ASRAudioEncoder._from_config(config.audio_config)
         self.vocab_size = config.text_config.vocab_size
         self.model = Qwen3ASRThinkerTextModel._from_config(config.text_config)
@@ -1426,6 +1443,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        # 这一步的目标非常明确：把音频张量变成“可直接塞进文本 embedding 序列”的连续向量。
+        #
+        # 返回结果不是按 batch 分开的 3D tensor，而是把所有样本的有效 audio features
+        # 在时间维上拼接成一个长序列。这样后面就可以按 placeholder mask 的线性展开顺序，
+        # 直接执行 `masked_scatter`。
         if feature_attention_mask is not None:
             feature_lens = torch.sum(feature_attention_mask, dim=1)
         elif audio_feature_lengths is not None:
@@ -1440,6 +1462,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         # very uneven audio lengths.
         # 中文学习备注：这里按样本逐条跑 audio_tower，
         # 目的是保证裁剪后的真实长度与 placeholder 数严格对齐。
+        # 换句话说，这里优先保证“对齐正确性”，而不是最大吞吐。
         audio_features = []
         for input_feature, feature_len in zip(input_features, feature_lens):
             # Slice away feature padding before entering the audio encoder so the
@@ -1454,6 +1477,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature = audio_output.last_hidden_state
             audio_features.append(audio_feature)
         audio_features = torch.cat(audio_features, dim=0)
+        # 形状直觉：
+        # 如果 batch 里三条音频最终各自产生 [30, 42, 18] 个 audio token，
+        # 那这里拼接后就是总长度 90 的一个长特征序列。
 
         return audio_features
 
@@ -1466,6 +1492,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
         equal to the length of multimodal features. If the lengths are different, an error is raised.
         """
+        # 这个函数回答的问题是：
+        # “在文本 embedding 序列里，哪些位置本来只是音频占位符，
+        #  之后应该被真正的 audio features 覆盖？”
+        #
+        # 因为 `masked_scatter` 的目标张量是 `inputs_embeds`，所以这里最终返回的 mask
+        # 也要扩展到和 `inputs_embeds` 同形状，而不是停留在 token 级 `(B, S)`。
         if input_ids is None:
             special_audio_mask = (
                 inputs_embeds
@@ -1518,6 +1550,13 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         """
 
+        # 从实现角度看，`forward()` 可以拆成 5 步：
+        # 1. 先把 `input_ids` 变成普通文本 embedding
+        # 2. 如果有音频输入，就跑 audio tower 得到 `audio_features`
+        # 3. 找到 prompt 里的音频占位位置，并用 `masked_scatter` 注入音频向量
+        # 4. 把整条多模态 embedding 序列送进文本 decoder
+        # 5. 用 `lm_head` 投到词表得到 logits / loss
+
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("You must provide `input_ids` when `inputs_embeds` is not supplied.")
@@ -1546,6 +1585,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             # 中文学习备注：
             # 从这一步开始，后面的文本 decoder 已经“不知道自己在看音频占位符”了，
             # 它只看到一段普通的 embedding 序列，其中部分位置来自 audio encoder。
+            #
+            # 这正是本架构最核心的思想：
+            # 不额外设计一套新的 decoder，而是把音频信息在 embedding 级别注入已有文本生成框架。
 
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
@@ -1590,6 +1632,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         # 中文学习备注：
         # 这里不再传 `input_ids`，而是直接传 `inputs_embeds`。
         # 原因很简单：音频已经被注入 embedding 级别，无法再用离散 token id 表达。
+        # 一旦完成 `masked_scatter`，后续 decoder 视角里就只剩“统一 embedding 序列”。
 
         hidden_states = outputs[0]
         # 中文学习备注：到这里为止，audio 信息已经完全混进 hidden_states 里了，
@@ -1629,6 +1672,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         # 中文学习备注：生成阶段的关键优化在这里：
         # 第一步需要音频特征；后续 token 续写只靠文本侧 KV cache，不必重复编码整段音频。
         # 这也是“重用同一份音频上下文”的关键，否则 streaming/offline 每步都会重复跑 audio_tower。
+        #
+        # 所以这一步实际上在回答：
+        # “多模态前缀哪些内容只需首步准备一次，哪些内容需要在每个生成 step 继续传？”
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1649,6 +1695,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         if cache_position is not None and cache_position[0] != 0:
             # Audio features are only needed on the first decoding step. Later
             # steps read from the text-side KV cache.
+            # 这行能显著减少生成时的重复计算量。
             model_inputs["input_features"] = None
 
         return model_inputs
@@ -1677,6 +1724,10 @@ class Qwen3ASRThinkerTextPreTrainedModel(PreTrainedModel):
 class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin):
     # 中文学习备注：最外层 API wrapper。
     # 用户通常拿到的是这个类；它内部再把工作转交给 thinker。
+    # 这层存在的意义主要是：
+    # 1. 作为 HF `AutoModel` 对应的顶层模型类
+    # 2. 保持对外接口稳定
+    # 3. 把真正复杂的多模态逻辑下沉到 `self.thinker`
     config_class = Qwen3ASRConfig
 
     def __init__(self, config: Qwen3ASRConfig):
@@ -1707,6 +1758,10 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
         # 中文学习备注：顶层 wrapper 自己不重新实现生成，
         # 它只是把参数整理后转发给真正的 thinker 子模块。
         # 语法点：这里通过拆 kwargs 的方式把“顶层通用参数”和“thinker 需要的参数”重新归类。
+        #
+        # 从架构上讲，这种转发层能保证：
+        # - 外部依然使用熟悉的 `model.generate(...)`
+        # - 内部复杂实现细节封装在 thinker，不暴露给调用者
 
         # Route kwargs to the thinker submodule while preserving the familiar
         # ``model.generate(...)`` surface on the wrapper class.

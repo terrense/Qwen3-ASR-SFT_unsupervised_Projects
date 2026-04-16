@@ -30,6 +30,21 @@ Several helpers look deceptively small, but they encode important assumptions
 about audio tensor layout, batching semantics and prompt formatting.
 """
 
+# 中文学习备注：
+# 这个文件非常值得先读，因为它处在“用户真实输入”和“模型严格要求”之间。
+# 你可以把它理解成推理系统的“清洗层 / 协议层”：
+#
+# 1. 清洗层：
+#    把路径、URL、base64、numpy 波形这些乱七八糟的输入，
+#    统一收敛成模型能接收的 `mono + 16kHz + float32 + [-1, 1]`。
+# 2. 切块层：
+#    把过长音频切成更安全的片段，并保留 offset 方便后面合并结果。
+# 3. 协议层：
+#    模型输出其实仍然是字符串，不是 JSON。
+#    所以这里还负责把 `"language Chinese<asr_text>..."` 这类文本协议重新解析成结构化结果。
+#
+# 如果你在读 `qwen3_asr.py` 时不明白它为什么可以接受各种输入、为什么能自动分块、
+# 为什么最后返回 `(language, text)`，答案大多都在本文件里。
 import base64
 import io
 import urllib.request
@@ -48,13 +63,18 @@ AudioLike = Union[
     str,                      # wav path / URL / base64
     Tuple[np.ndarray, int],   # (waveform, sr)
 ]
+# `MaybeList` 是一个很常见的“外部接口友好、内部统一处理”技巧：
+# 对外既允许传单个对象，也允许传 list；对内则尽早把它统一成 list。
 MaybeList = Union[Any, List[Any]]
 
 # The released checkpoints and feature extractor operate on 16 kHz audio. All
 # user-provided audio is resampled into this canonical rate before inference.
 SAMPLE_RATE = 16000
+# 普通 ASR 最长允许的单段时长；超过后会先切块再识别。
 MAX_ASR_INPUT_SECONDS = 1200
+# 强制对齐的安全输入长度更短，因为对齐阶段通常更吃资源。
 MAX_FORCE_ALIGN_INPUT_SECONDS = 180
+# 太短的音频会让特征抽取和模型行为不稳定，所以切块后会按最小时长做零填充。
 MIN_ASR_INPUT_SECONDS = 0.5
 SUPPORTED_LANGUAGES: List[str] = [
     "Chinese",
@@ -106,6 +126,9 @@ def normalize_language_name(language: str) -> str:
     Raises:
         ValueError: If language is empty.
     """
+    # 这里做的是“规范化”，不是“翻译”。
+    # 例如传入 `cHINese`、` chinese `，最终都会统一成 `Chinese`，
+    # 这样后续语言校验和 prompt 构造才能用同一套标准名字。
     if language is None:
         raise ValueError("language is None")
     s = str(language).strip()
@@ -124,6 +147,9 @@ def validate_language(language: str) -> None:
     Raises:
         ValueError: If unsupported.
     """
+    # 本函数不返回布尔值，而是直接在非法时抛错。
+    # 这种 fail-fast 风格适合用户输入校验：一旦语言名不合法，就尽早终止，
+    # 避免后面进入模型推理后才发现问题。
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(f"Unsupported language: {language}. Supported: {SUPPORTED_LANGUAGES}")
 
@@ -135,6 +161,8 @@ def ensure_list(x: MaybeList) -> List[Any]:
     This is a common Python API pattern: the public method accepts both a single
     item and a batch, while the internal implementation only works on lists.
     """
+    # 读仓库时看到很多函数签名写成 `Union[T, List[T]]`，通常都会配一层这种统一函数。
+    # 这样做能显著减少后续 if/else 分支数量。
     return x if isinstance(x, list) else [x]
 
 
@@ -155,6 +183,9 @@ def is_probably_base64(s: str) -> bool:
     but routing obviously non-path, non-URL long strings into the base64 decode
     path before we try opening them as local files.
     """
+    # 这是一个启发式判断，不保证 100% 准确。
+    # 设计重点不是“严格识别 MIME”，而是尽量把明显不是路径的长字符串，
+    # 在早期路由到 base64 分支。
     if s.startswith("data:audio"):
         return True
     if ("/" not in s and "\\" not in s) and len(s) > 256:
@@ -177,6 +208,12 @@ def load_audio_any(x: str) -> Tuple[np.ndarray, int]:
     URL/base64 payloads are decoded with ``soundfile`` from memory, while local
     paths are delegated to ``librosa`` for broader file-format support.
     """
+    # 这一步本质上在解决“同一个参数 `x`，可能是三种完全不同的传输介质”：
+    # - URL：先下载字节流
+    # - base64：先解码字节流
+    # - 本地路径：直接从文件系统读取
+    #
+    # 但无论走哪条路径，最终都要统一成 `(waveform, sample_rate)`。
     if is_url(x):
         with urllib.request.urlopen(x) as resp:
             audio_bytes = resp.read()
@@ -209,6 +246,8 @@ def to_mono(audio: np.ndarray) -> np.ndarray:
         decoders return ``(T, C)`` while other audio pipelines prefer ``(C, T)``,
         so a shape heuristic is used before reducing the channel axis.
     """
+    # 从 ASR 角度看，多声道的空间信息通常不是第一优先级，
+    # 时间内容才是关键，所以这里直接做均值 downmix。
     if audio.ndim == 1:
         return audio
     # soundfile can return shape (T, C); some pipelines use (C, T)
@@ -252,6 +291,13 @@ def normalize_audio_input(a: AudioLike) -> np.ndarray:
         np.ndarray:
             Mono 16k float32 waveform in [-1, 1].
     """
+    # 这是“单条音频标准化”的总入口。你可以把它看成 4 个固定阶段：
+    # 1. 读入：把路径/URL/base64/ndarray 统一成 `(audio, sr)`
+    # 2. 单声道化：统一成 1D waveform
+    # 3. 重采样：统一成 16kHz
+    # 4. 振幅规范化：统一到 float32 和 [-1, 1]
+    #
+    # 只要经过这个函数，后续推理代码就可以假设输入已经满足模型契约。
     if isinstance(a, str):
         audio, sr = load_audio_any(a)
     elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):
@@ -261,6 +307,8 @@ def normalize_audio_input(a: AudioLike) -> np.ndarray:
 
     audio = to_mono(np.asarray(audio))
     if sr != SAMPLE_RATE:
+        # 重采样是为了和训练/processor 约定完全一致。
+        # 即使用户给的是高采样率音频，模型最终看到的仍然是 16kHz。
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE).astype(np.float32)
     audio = float_range_normalize(audio)
     return audio
@@ -268,6 +316,7 @@ def normalize_audio_input(a: AudioLike) -> np.ndarray:
 
 def normalize_audios(audios: Union[AudioLike, List[AudioLike]]) -> List[np.ndarray]:
     """Batch wrapper around :func:`normalize_audio_input`."""
+    # 外部接口允许单个音频或批量音频；内部始终转成 `List[np.ndarray]`。
     items = ensure_list(audios)
     return [normalize_audio_input(a) for a in items]
 
@@ -283,6 +332,8 @@ def chunk_list(xs: List[Any], chunk_size: int) -> Iterable[List[Any]]:
     Yields:
         List[Any]: Slices of xs.
     """
+    # `chunk_size <= 0` 被解释成“不分块”，这是工程上很常见的约定，
+    # 能让上层把 `-1` 当作“尽量整批跑”的开关。
     if chunk_size <= 0:
         yield xs
         return
@@ -302,6 +353,10 @@ class AudioChunk:
         sr: Sampling rate.
         offset_sec: Start offset of this chunk in the original audio, in seconds.
     """
+    # 这个小 dataclass 很关键，因为它保存了“切块后还能回到原始样本时间线”的最小信息：
+    # - 属于原 batch 中哪一条样本
+    # - 是该样本的第几个 chunk
+    # - 这个 chunk 在原音频里从几秒开始
     orig_index: int
     chunk_index: int
     wav: np.ndarray
@@ -333,6 +388,16 @@ def split_audio_into_chunks(
     Returns:
         List[Tuple[np.ndarray, float]]: List of (chunk_wav, offset_sec).
     """
+    # 这是长音频处理的关键函数。
+    # 设计目标不是简单地“每 N 秒硬切一刀”，而是尽量在目标切点附近寻找低能量位置，
+    # 避免把一个音节或词语从中间截断。
+    #
+    # 同时它还必须满足一个工程上很重要的性质：
+    # 切块后再按顺序拼回去，样本总数必须和原音频完全一致。
+    # 也就是：
+    # - 没有重叠
+    # - 没有空洞
+    # - 不会丢采样点
     wav = np.asarray(wav, dtype=np.float32)
     if wav.ndim > 1:
         wav = np.mean(wav, axis=-1).astype(np.float32)
@@ -340,6 +405,7 @@ def split_audio_into_chunks(
     total_len = int(wav.shape[0])
     total_sec = total_len / float(sr)
     if total_sec <= max_chunk_sec:
+        # 足够短时不做任何切块，直接原样返回，offset 从 0 开始。
         return [(wav, 0.0)]
 
     # ``max_len`` is the nominal cut point. We then look around that area for a
@@ -360,6 +426,7 @@ def split_audio_into_chunks(
         right = min(total_len, cut + expand)
 
         if right - left <= win:
+            # 搜索窗口过小时，说明附近没什么可选余地，只能回退到名义切点。
             boundary = cut
         else:
             seg = wav[left:right]
@@ -378,6 +445,9 @@ def split_audio_into_chunks(
             inner = int(np.argmin(local))
             boundary = left + wstart + inner
 
+        # 防御性约束：
+        # - 至少往前推进 1 个 sample，避免死循环
+        # - 不能越过整段音频末尾
         boundary = int(max(boundary, start + 1))
         boundary = int(min(boundary, total_len))
 
@@ -393,6 +463,10 @@ def split_audio_into_chunks(
     # Very short clips are awkward for encoder feature extraction. Padding only
     # happens after chunk boundaries are finalized so timestamp offsets still
     # refer to the original unpadded audio.
+    # 中文学习备注：
+    # 这里先切边界，再补 pad，非常重要。
+    # 因为 offset 的意义必须始终对应“原始真实音频时间线”，
+    # 不能让后加的静音 padding 污染时间定位。
     min_len = int(MIN_ASR_INPUT_SECONDS * sr)
     padded: List[Tuple[np.ndarray, float]] = []
     for c, off in chunks:
@@ -414,7 +488,13 @@ def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
     of times. This function first removes obvious character runs and then looks
     for short repeated substrings.
     """
+    # 这是生成式 ASR 常见的后处理兜底：
+    # 当音频含糊、边界不稳定或模型解码发散时，可能出现“啊啊啊啊啊...”、
+    # “hellohellohello...” 这种循环输出。
+    #
+    # 这里不是做语言学上的精确纠错，而是优先处理明显失真的病理重复。
     def fix_char_repeats(s, thresh):
+        # 第一层：处理单字符连续爆炸重复，例如 "哈哈哈哈...."
         res = []
         i = 0
         n = len(s)
@@ -432,6 +512,8 @@ def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
         return ''.join(res)
 
     def fix_pattern_repeats(s, thresh, max_len=20):
+        # 第二层：处理短模式重复，例如 "你好你好你好..." / "abcabcabc..."
+        # `max_len` 限制了待尝试的重复单元长度，避免在长字符串上退化得太慢。
         n = len(s)
         min_repeat_chars = thresh * 2
         if n < min_repeat_chars:
@@ -504,6 +586,13 @@ def parse_asr_output(
     Returns:
         Tuple[str, str]: (language, text)
     """
+    # 这是整个推理协议里最关键的“文本 -> 结构化结果”桥接函数之一。
+    #
+    # 要点在于：模型本质上仍是语言模型，所以输出首先是一段字符串；
+    # 但上层应用想要的是结构化结果 `(language, text)`。
+    # 因此这里需要把一个轻量文本协议重新解释回来。
+    #
+    # 你可以把它理解成一个很小的 parser，而不是普通字符串清洗函数。
     if raw is None:
         return "", ""
     s = str(raw).strip()
@@ -516,6 +605,8 @@ def parse_asr_output(
 
     if user_language:
         # user explicitly forced language => model output is treated as pure text
+        # 这里的含义是：既然用户已经指定语言，那么模型就不需要再“自报语言”，
+        # 我们直接把生成串当成纯文本转写结果使用。
         return user_language, s
 
     meta_part = s
@@ -525,6 +616,8 @@ def parse_asr_output(
         meta_part, text_part = s.split(_ASR_TEXT_TAG, 1)
     else:
         # no tag => pure text
+        # 没看到 `<asr_text>` 时，就按“整串都是文本”处理。
+        # 这是一个兼容策略，避免 parser 对轻微格式漂移过于脆弱。
         return "", s.strip()
 
     meta_lower = meta_part.lower()
@@ -533,6 +626,7 @@ def parse_asr_output(
     if "language none" in meta_lower:
         t = text_part.strip()
         if not t:
+            # 空音频或静音段的常见协议形式。
             return "", ""
         # if model still returned something, keep it but language unknown
         return "", t
@@ -569,6 +663,9 @@ def merge_languages(langs: List[str]) -> str:
     Returns:
         str: Merged language string.
     """
+    # 多 chunk 长音频里，不同片段可能预测出不同语言。
+    # 这里不做复杂投票，而是保留时间顺序，并去掉空值和连续重复项。
+    # 因此它表达的更像“语言轨迹摘要”，而不是单一分类标签。
     out: List[str] = []
     prev = None
     for x in langs:

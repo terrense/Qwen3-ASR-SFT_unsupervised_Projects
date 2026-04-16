@@ -30,6 +30,11 @@ structure.
 #
 # 也就是说，如果你把 `qwen_asr/core/transformers_backend` 当成一个小子系统，
 # 这个 `__init__.py` 就是它对外暴露的最小 API 面。
+#
+# 上层 `inference/qwen3_asr.py` 正是通过这里拿到三件套，再进一步完成：
+# - AutoConfig / AutoModel / AutoProcessor 注册
+# - 模型与 processor 初始化
+# - 高层推理封装
 
 from .configuration_qwen3_asr import Qwen3ASRConfig
 from .modeling_qwen3_asr import Qwen3ASRForConditionalGeneration

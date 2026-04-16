@@ -21,6 +21,10 @@ interactive shell, so this module simply points users toward the intended CLI
 commands.
 """
 
+# 中文学习备注：
+# 这个文件不是功能入口，而是“命令提示入口”。
+# 也就是说，运行 `python -m qwen_asr` 时，它不会真的启动模型服务或 demo，
+# 只是告诉用户这个包真正推荐使用的几个 CLI 命令是什么。
 def main():
     """Print the supported top-level command line entry points."""
     print(

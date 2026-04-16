@@ -30,6 +30,27 @@ on application concerns:
    user-friendly result structure.
 """
 
+# 中文学习备注：
+# 如果说 `modeling_qwen3_asr.py` 解决的是“张量怎么算”，
+# 那本文件解决的是“用户到底怎么方便地用这个模型”。
+#
+# 它是整个仓库里最典型的“应用层封装”：
+# - 上游接收用户的 Python 参数和多种音频输入形式
+# - 中间把长音频切块、整理 prompt、分发到不同后端
+# - 下游把模型输出重新拼成一个稳定、好用的 Python 结果对象
+#
+# 因此读这个文件时，最好不要把它当成“模型细节文件”，而是当成：
+# “从用户调用到模型返回之间的总调度器”。
+#
+# 最推荐的阅读主线是：
+# 1. `Qwen3ASRModel.from_pretrained()` / `Qwen3ASRModel.LLM()`
+#    看对象是如何被初始化成 Transformers / vLLM 两种后端的。
+# 2. `transcribe()`
+#    看离线推理主流程：标准化 -> 广播 -> 切块 -> 推理 -> 解析 -> 合并。
+# 3. `_infer_asr_transformers()` / `_infer_asr_vllm()`
+#    看两种后端在请求格式上的差异。
+# 4. `init_streaming_state()` / `streaming_transcribe()` / `finish_streaming_transcribe()`
+#    看流式识别是如何通过“重复全上下文解码 + prefix 回退”实现的。
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -44,6 +65,10 @@ from transformers import AutoConfig, AutoModel, AutoProcessor
 
 # Registering custom config/model/processor classes makes the checkpoints work
 # with Hugging Face auto classes just like first-party architectures.
+# 中文学习备注：
+# 这三行注册非常重要，它们在做“自定义架构接入 Hugging Face 生态”这件事。
+# 注册后，外部只需要拿到 checkpoint + config 里的 `model_type=qwen3_asr`，
+# 就能通过 `AutoConfig/AutoModel/AutoProcessor` 自动恢复正确类。
 AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
 AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)
 AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
@@ -75,6 +100,9 @@ from .utils import (
 try:
     from qwen_asr.core.vllm_backend import Qwen3ASRForConditionalGeneration
     from vllm import ModelRegistry
+    # vLLM 也需要知道“某个模型名应该映射到哪个 Python 类”。
+    # 这里的注册作用，和上面的 AutoModel 注册在思想上是相同的，
+    # 只是服务对象从 HF 变成了 vLLM。
     ModelRegistry.register_model("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration)
 except:
     # vLLM is an optional dependency. Import failure is deferred until the user
@@ -97,6 +125,8 @@ class ASRTranscription:
             Forced aligner output (ForcedAlignResult).
             Present only when return_time_stamps=True.
     """
+    # 这个 dataclass 是离线识别最终返回给调用者的“稳定结果壳”。
+    # 相比直接返回 tuple/dict，它的优点是字段语义更明确，也更方便 IDE 补全。
     language: str
     text: str
     time_stamps: Optional[Any] = None
@@ -138,6 +168,8 @@ class ASRStreamingState:
             Internal accumulated decoded raw text (before parse_asr_output normalization).
             Used for rollback/token trimming and as prefix for prompting.
     """
+    # 流式识别没有一次性完成，所以需要一个可变状态对象把跨 chunk 的上下文记下来。
+    # 可以把它理解成“单条音频流会话”的运行时上下文。
     unfixed_chunk_num: int
     unfixed_token_num: int
     chunk_size_sec: float
@@ -169,6 +201,14 @@ class Qwen3ASRModel:
       - If language is provided, the prompt will force the output to be text-only by appending
         "language {Language}<asr_text>" to the assistant prompt.
     """
+    # 这是仓库里最重要的用户级封装类。
+    # 它的核心设计不是继承某个底层模型，而是“组合”不同后端对象，
+    # 再暴露出统一的 ASR 接口。
+    #
+    # 这样做的最大好处是：
+    # - 用户只学一个 `Qwen3ASRModel`
+    # - 底层到底是 Transformers 还是 vLLM，对调用接口影响很小
+    # - 应用层逻辑（切块、合并、语言解析、时间戳对齐）可以复用
 
     def __init__(
         self,
@@ -188,6 +228,8 @@ class Qwen3ASRModel:
             plain composition instead, which keeps the public API stable even
             though the underlying execution engines differ significantly.
         """
+        # `backend` 是整个类后续分派逻辑的核心开关。
+        # 很多方法名相同，但底层执行路径完全不同，因此这里先把关键对象都存下来。
         self.backend = backend  # "transformers" | "vllm"
         self.model = model
         self.processor = processor
@@ -197,6 +239,8 @@ class Qwen3ASRModel:
         self.max_new_tokens = max_new_tokens
 
         if backend == "transformers":
+            # Transformers 后端直接持有 torch model，因此这里顺手缓存 device/dtype，
+            # 方便后面把 processor 输出迁移到同一设备和精度。
             self.device = getattr(model, "device", None)
             if self.device is None:
                 try:
@@ -205,6 +249,7 @@ class Qwen3ASRModel:
                     self.device = torch.device("cpu")
             self.dtype = getattr(model, "dtype", torch.float32)
         else:
+            # vLLM 后端不通过这里手动 `.to(device)`，所以 device/dtype 对应用层意义不大。
             self.device = None
             self.dtype = None
 
@@ -238,7 +283,10 @@ class Qwen3ASRModel:
         Returns:
             Qwen3ASRModel
         """
-
+        # 这条路径对应 Hugging Face / PyTorch 推理。
+        # 用户给一个 repo id 或本地模型目录，底层会恢复：
+        # - model：自定义 Qwen3-ASR 模型
+        # - processor：文本模板 + 音频特征提取器
         model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True)
@@ -254,6 +302,7 @@ class Qwen3ASRModel:
                 forced_aligner, **(forced_aligner_kwargs or {})
             )
 
+        # 注意这里返回的不是底层 HF model，而是统一包装后的 `Qwen3ASRModel`。
         return cls(
             backend="transformers",
             model=model,
@@ -299,6 +348,8 @@ class Qwen3ASRModel:
         Raises:
             ImportError: If vLLM is not installed.
         """
+        # 这条路径对应 vLLM 推理，特点是更偏部署/吞吐场景。
+        # 与 `from_pretrained()` 不同，这里底层拿到的是 vllm.LLM 引擎实例。
         try:
             from vllm import LLM as vLLM
             from vllm import SamplingParams
@@ -310,6 +361,7 @@ class Qwen3ASRModel:
         llm = vLLM(model=model, **kwargs)
 
         processor = Qwen3ASRProcessor.from_pretrained(model, fix_mistral_regex=True)
+        # vLLM 把采样参数单独包装成对象，和 Transformers 的 generate kwargs 不同。
         sampling_params = SamplingParams(**({"temperature": 0.0, "max_tokens": max_new_tokens}))
 
         forced_aligner_model = None
@@ -340,6 +392,7 @@ class Qwen3ASRModel:
         Returns:
             List[str]: Canonical language names.
         """
+        # 返回副本而不是原列表，避免调用者意外修改模块级常量。
         return list(SUPPORTED_LANGUAGES)
 
     @torch.no_grad()
@@ -378,6 +431,14 @@ class Qwen3ASRModel:
                 - If language is unsupported.
                 - If batch sizes mismatch for context/language.
         """
+        # 可以把 `transcribe()` 理解成 7 个连续阶段：
+        # 1. 输入音频标准化
+        # 2. 标量参数广播成 batch
+        # 3. 长音频切块
+        # 4. chunk 级模型推理
+        # 5. 文本协议解析
+        # 6. 可选时间戳对齐
+        # 7. 按原样本重新合并
         if return_time_stamps and self.forced_aligner is None:
             raise ValueError("return_time_stamps=True requires `forced_aligner` to be provided at initialization.")
 
@@ -430,6 +491,8 @@ class Qwen3ASRModel:
                 max_chunk_sec=max_chunk_sec,
             )
             for j, (cwav, offset_sec) in enumerate(parts):
+                # `orig_index + chunk_index + offset_sec` 这三项组合起来，
+                # 就足以在后处理阶段恢复原 batch 顺序和时间线。
                 chunks.append(AudioChunk(orig_index=i, chunk_index=j, wav=cwav, sr=SAMPLE_RATE, offset_sec=offset_sec))
 
         # Step 4: run chunk-level recognition in backend-sized batches.
@@ -442,6 +505,8 @@ class Qwen3ASRModel:
         per_chunk_lang: List[str] = []
         per_chunk_text: List[str] = []
         for out, forced_lang in zip(raw_outputs, chunk_lang):
+            # 若用户强制指定语言，则 parser 直接把输出当纯文本看；
+            # 否则 parser 会尝试从模型输出中提取 `language ... <asr_text> ...` 结构。
             lang, txt = parse_asr_output(out, user_language=forced_lang)
             per_chunk_lang.append(lang)
             per_chunk_text.append(txt)
@@ -458,6 +523,7 @@ class Qwen3ASRModel:
 
             for idx, (c, txt, lang_pred) in enumerate(zip(chunks, per_chunk_text, per_chunk_lang)):
                 if txt.strip() == "":
+                    # 空文本没有必要送去对齐器，既节省时间，也避免无意义输出。
                     continue
                 to_align_audio.append((c.wav, c.sr))
                 to_align_text.append(txt)
@@ -510,6 +576,8 @@ class Qwen3ASRModel:
 
     def _build_messages(self, context: str, audio_payload: Any) -> List[Dict[str, Any]]:
         """Build the chat-style multimodal message list expected by the processor."""
+        # Qwen3-ASR 继承了 chat-style multimodal prompt 习惯：
+        # system 放上下文，user content 里放 audio。
         return [
             {"role": "system", "content": context or ""},
             {"role": "user", "content": [{"type": "audio", "audio": audio_payload}]},
@@ -522,6 +590,9 @@ class Qwen3ASRModel:
         If force_language is provided, "language X<asr_text>" is appended after the generation prompt
         to request text-only output.
         """
+        # 关键点：
+        # 这里构造的是“文本 prompt 外壳”，不是实际音频张量输入。
+        # 真正的 waveform 会在 processor/model 或 vLLM multi_modal_data 里单独提供。
         # The template renderer only needs the multimodal conversation shape to
         # produce the textual prompt. Actual waveform tensors are supplied via
         # the processor/model path later.
@@ -550,6 +621,8 @@ class Qwen3ASRModel:
         Returns:
             List[str]: Raw decoded strings (one per chunk).
         """
+        # 这是一个薄分派层，真正目的只有一个：
+        # 根据 `self.backend` 把统一的 chunk 输入路由到对应后端实现。
         if self.backend == "transformers":
             return self._infer_asr_transformers(contexts, wavs, languages)
         if self.backend == "vllm":
@@ -568,6 +641,12 @@ class Qwen3ASRModel:
         The processor creates both tokenized text inputs and audio features; the
         model then autoregressively generates new tokens after the prompt.
         """
+        # Transformers 路径的关键数据流是：
+        # prompt text + raw wav
+        # -> processor
+        # -> input_ids / input_features / masks
+        # -> model.generate()
+        # -> decode newly generated suffix
         outs: List[str] = []
 
         texts = [self._build_text_prompt(context=c, force_language=fl) for c, fl in zip(contexts, languages)]
@@ -579,6 +658,9 @@ class Qwen3ASRModel:
         for i in range(0, len(texts), batch_size):
             sub_text = texts[i : i + batch_size]
             sub_wavs = wavs[i : i + batch_size]
+            # processor 同时做两件事：
+            # 1. 把文本 prompt token 化
+            # 2. 把音频转成模型所需特征
             inputs = self.processor(text=sub_text, audio=sub_wavs, return_tensors="pt", padding=True)
             inputs = inputs.to(self.model.device).to(self.model.dtype)
 
@@ -602,6 +684,9 @@ class Qwen3ASRModel:
         languages: List[Optional[str]],
     ) -> List[str]:
         """Run chunk-level ASR with vLLM's prompt-plus-multimodal-data API."""
+        # vLLM 路径和 Transformers 最大差异在于请求格式：
+        # 它不是把所有张量先在 Python 侧整理好再喂模型，
+        # 而是把 prompt 和多模态数据按引擎约定打包成 request dict。
         inputs: List[Dict[str, Any]] = []
         for c, w, fl in zip(contexts, wavs, languages):
             prompt = self._build_text_prompt(context=c, force_language=fl)
@@ -631,6 +716,8 @@ class Qwen3ASRModel:
         Returns:
             ForcedAlignResult: New object with shifted timestamps.
         """
+        # 对齐器返回的是“chunk 内局部时间”，而用户想看到的是“原始整段音频绝对时间”。
+        # 这里就是把 chunk 起点 `offset_sec` 加回去。
         if result is None:
             return None
         # Upstream dataclasses are frozen, so we reconstruct them instead of
@@ -652,6 +739,8 @@ class Qwen3ASRModel:
         Returns:
             ForcedAlignResult or None
         """
+        # 因为 chunk 顺序本身就是按时间顺序生成的，所以这里不需要再排序，
+        # 直接顺序拼接 items 即可得到完整时间线。
         if not results:
             return None
         all_items = []
@@ -706,6 +795,7 @@ class Qwen3ASRModel:
                 - If chunk_size_sec <= 0.
                 - If forced language is invalid (same validation rules as transcribe()).
         """
+        # 流式识别只支持 vLLM，因为这里的实现依赖它更适合在线反复调用的推理接口。
         if self.backend != "vllm":
             raise ValueError("Streaming ASR is supported only for vLLM backend (backend='vllm').")
         if chunk_size_sec is None or float(chunk_size_sec) <= 0:
@@ -724,6 +814,7 @@ class Qwen3ASRModel:
         # invariant across incremental streaming updates.
         prompt_raw = self._build_text_prompt(context=context, force_language=force_language)
 
+        # 返回的是一个“初始化好的可变会话状态”，而不是立即开始识别。
         return ASRStreamingState(
             unfixed_chunk_num=int(unfixed_chunk_num),
             unfixed_token_num=int(unfixed_token_num),
@@ -780,6 +871,13 @@ class Qwen3ASRModel:
             ValueError:
                 If backend is not "vllm" or state is invalid.
         """
+        # 这一版 streaming 并不是传统的“真正增量声学状态缓存”实现。
+        # 它的思想更接近：
+        # - 音频按固定 chunk 收集
+        # - 每来一个新 chunk，就把“截至当前的全部音频”重新送去解码
+        # - 用 prefix 回退策略减轻 chunk 边界抖动
+        #
+        # 这样做计算上更重，但实现简单，而且离线/在线两条路径更一致。
         if self.backend != "vllm":
             raise ValueError("streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
@@ -823,6 +921,7 @@ class Qwen3ASRModel:
             # Build prefix with rollback strategy
             prefix = ""
             if state.chunk_id < state.unfixed_chunk_num:
+                # 初期 chunk 通常不稳定，直接不继承旧文本，避免错误前缀放大。
                 prefix = ""
             else:
                 cur_ids = self.processor.tokenizer.encode(state._raw_decoded)
@@ -851,6 +950,8 @@ class Qwen3ASRModel:
 
             # Keep the exact model text before structured parsing because future
             # rollback operates in tokenizer space over this raw string.
+            # 这里保存 raw decoded 非常重要：
+            # parser 可能会做清洗或格式解释，但下一轮 prefix 回退需要的是“原始模型文本”。
             state._raw_decoded = (prefix + gen_text) if prefix is not None else gen_text
 
             lang, txt = parse_asr_output(state._raw_decoded, user_language=state.force_language)
@@ -885,6 +986,8 @@ class Qwen3ASRModel:
             ValueError:
                 If backend is not "vllm" or state is invalid.
         """
+        # 这个函数专门处理“最后一截不满 chunk 的尾音频”。
+        # 如果不 flush，它就会永远留在 buffer 里，最终结果会少最后一小段内容。
         if self.backend != "vllm":
             raise ValueError("finish_streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
@@ -912,6 +1015,9 @@ class Qwen3ASRModel:
             cur_ids = self.processor.tokenizer.encode(state._raw_decoded)
             # Keep at least one token when possible; an entirely empty carry-over
             # tends to make the final tail decode less stable.
+            # 中文学习备注：
+            # 这里和中间 chunk 略有不同：尾段 flush 时尽量保留至少一个 token，
+            # 否则最后一次解码有时会因为上下文过空而变得不稳定。
             end_idx = max(1, len(cur_ids) - int(state.unfixed_token_num))
             prefix = self.processor.tokenizer.decode(cur_ids[:end_idx])
 

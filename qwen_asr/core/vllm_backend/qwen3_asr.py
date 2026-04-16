@@ -131,6 +131,12 @@ logger = init_logger(__name__)
 # 3. `Qwen3ASRMultiModalProcessor`：看 prompt 占位符如何扩写
 # 4. `Qwen3ASRForConditionalGeneration.embed_multimodal/embed_input_ids`
 #    ：看音频 embedding 如何并进文本序列
+#
+# 如果从“和 HF 版对照学习”的角度看，这份文件最值得抓的对应关系是：
+# - HF `Qwen3ASRProcessor`              <-> vLLM `Qwen3ASRMultiModalProcessor`
+# - HF `get_audio_features()`          <-> vLLM `_process_audio_input()/embed_multimodal()`
+# - HF `masked_scatter(...)`           <-> vLLM `_merge_multimodal_embeddings(...)`
+# - HF `Qwen3ASRForConditionalGeneration` <-> 这里的同名 vLLM 适配模型类
 
 
 def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
@@ -721,6 +727,10 @@ class Qwen3ASRMultiModalProcessor(
     # 中文学习备注：
     # 这个类是 vLLM 路径里最值得学的胶水层。
     # 因为“音频怎么从一个占位符变成 N 个 placeholder token”就是它决定的。
+    #
+    # 你可以把它理解成 vLLM 世界里的 processor-planner：
+    # 它不仅要做前处理，还要把多模态字段布局、prompt 替换策略、占位符长度规划
+    # 一起告诉 vLLM 运行时。
 
     def _get_data_parser(self) -> MultiModalDataParser:
         # 中文学习备注：把输入音频解析器固定成 Qwen3-ASR 自己这套。
@@ -747,6 +757,10 @@ class Qwen3ASRMultiModalProcessor(
         # vLLM 路径里，“一个音频占位符到底要扩成多少个序列位置”就是在这里显式决定的。
         # 数量必须和 audio_tower 产出的 feature 数一模一样，否则后面 embedding 合并会报 shape 错。
         # 这一步非常关键，因为 vLLM 的文本 token 规划和 multimodal embedding 注入是分开的。
+        #
+        # 和 HF 版相比，这里最大的思维差异是：
+        # HF 更像“processor 先把 prompt 整成最终长度，再一起喂模型”；
+        # vLLM 更像“先把替换计划显式告诉运行时，再由运行时完成后续调度”。
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
         vocab = tokenizer.get_vocab()
@@ -813,6 +827,14 @@ class Qwen3ASRForConditionalGeneration(
     # 你可以把它理解成“HF 版 ThinkerForConditionalGeneration 的 vLLM 适配壳”。
     # 上面的 `@MULTIMODAL_REGISTRY.register_processor(...)` 是注册 decorator：
     # 它会把这个模型类和对应的 processor/info/dummy builder 绑定进 vLLM 的多模态注册表。
+    #
+    # 这类代码读起来会比 HF 版更“工程化”，因为它除了模型本体之外，
+    # 还要额外满足 vLLM 对：
+    # - 多模态字段注册
+    # - prompt 占位符规划
+    # - 权重前缀映射
+    # - tensor parallel 层实现
+    # 的一整套运行时要求。
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -846,6 +868,7 @@ class Qwen3ASRForConditionalGeneration(
 
         # 中文学习备注：这里不是另起一套模型，而是把“音频塔 + Qwen3 文本模型”
         # 接进 vLLM 的多模态运行时。
+        # 也就是说，架构思想和 HF 版并没变，变化的是执行器、层实现和注册接口。
         self.audio_tower = Qwen3ASRAudioEncoder(
             thinker_config.audio_config,
             multimodal_config=multimodal_config,
@@ -919,6 +942,7 @@ class Qwen3ASRForConditionalGeneration(
         )
         return audio_features.split(audio_output_lengths.tolist())
         # 中文学习备注：`.split(lengths)` 会把一条总 embedding 序列切回“每条音频自己的那一段”。
+        # 这是因为 vLLM 后面的多模态合并接口是按“一个多模态样本一段 embedding”来消费的。
 
     def get_language_model(self) -> torch.nn.Module:
         # 中文学习备注：vLLM 上层有时只关心“文本模型部分”。
@@ -933,6 +957,7 @@ class Qwen3ASRForConditionalGeneration(
         """
         # 中文学习备注：vLLM 的思路是“先单独把音频编码成 embeddings，
         # 再在更晚的阶段和文本 embedding 合并”。
+        # 因此这里返回的不是最终 `inputs_embeds`，而是一个待合并的多模态 embedding 集合。
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -974,6 +999,7 @@ class Qwen3ASRForConditionalGeneration(
         # vLLM's multimodal planner.
         # 中文学习备注：这一步和 Transformers 版的 `masked_scatter` 是同一件事，
         # 只是这里换成了 vLLM 统一的多模态合并接口。
+        # 也正因为占位位置已经由 planner 事先算好，这里只需要执行“按计划合并”。
         inputs_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
@@ -1014,6 +1040,8 @@ class Qwen3ASRForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # 中文学习备注：复用 AutoWeightsLoader，把 HF checkpoint 权重映射进 vLLM 模块树。
+        # `hf_to_vllm_mapper` 的作用就在这里体现：
+        # 它负责把 HF 版模块前缀改写成 vLLM 版模块树中的对应路径。
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["talker.", "code2wav."],
